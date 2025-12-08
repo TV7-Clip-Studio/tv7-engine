@@ -1,0 +1,57 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  determine-context:
+    runs-on: ubuntu-latest
+    outputs:
+      info: ${{ steps.context.outputs.info }}
+    steps:
+      - name: Determine Rust/Axum context
+        id: context
+        run: |
+          set -eo pipefail
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          from pathlib import Path
+
+          cargo = Path("Cargo.toml")
+          info = "General Codebase"
+
+          if cargo.exists():
+              data = tomllib.loads(cargo.read_text(encoding="utf-8"))
+              pkg = data.get("package", {})
+              edition = pkg.get("edition", "unknown")
+              rust_version = pkg.get("rust-version", "unspecified")
+
+              deps = data.get("dependencies", {})
+              key = []
+              for name, val in deps.items():
+                  if len(key) >= 4:
+                      break
+                  if isinstance(val, str):
+                      key.append(f"{name} {val}")
+                  elif isinstance(val, dict):
+                      ver = val.get("version") or val.get("git") or val.get("path")
+                      if ver:
+                          key.append(f"{name} {ver}")
+
+              info = f"Rust edition {edition}; rust-version {rust_version}; key crates: {', '.join(key) if key else 'n/a'} (Cargo.toml)"
+
+          print(f"info={info}")
+          PY
+
+  deepseek-review:
+    needs: determine-context
+    uses: TV7-Clip-Studio/tv7-core/.github/workflows/deepseek-review.yml@main
+    with:
+      project_context: ${{ needs.determine-context.outputs.info }}
+    secrets: inherit
