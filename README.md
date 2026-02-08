@@ -5,7 +5,7 @@ Local-first engine that powers media and AI workloads for the TV7 app. The codeb
 ## Docs
 - `docs/architecture.md` – Core + Service layout, runtime model, and integration expectations.
 - `docs/api_spec.md` – HTTP contract for video, audio, and LLM endpoints (local-only).
-- `docs/roadmap.md` – phased plan aligned with the new workspace structure.
+- `docs/core/roadmaps/tv7-axum-engine-roadmap.md` – phased plan aligned with the new workspace structure.
 - `docs/tv7_high_architecture.md` – broader product/system context for TV7 Core/Pro.
 
 ## Current Status
