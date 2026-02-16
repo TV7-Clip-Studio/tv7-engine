@@ -1,0 +1,4 @@
+interface:
+  display_name: "Engine Local Diagnostics"
+  short_description: "Diagnose build, startup, and local runtime failures"
+  default_prompt: "Use $engine-local-diagnostics to triage a local engine failure and drive it to a verified fix."

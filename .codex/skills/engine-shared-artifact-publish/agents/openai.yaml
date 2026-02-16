@@ -1,0 +1,4 @@
+interface:
+  display_name: "Engine Shared Artifacts"
+  short_description: "Publish engine contracts to shared docs/core paths"
+  default_prompt: "Use $engine-shared-artifact-publish to upload updated engine contract artifacts into the shared docs/core contracts tree."
