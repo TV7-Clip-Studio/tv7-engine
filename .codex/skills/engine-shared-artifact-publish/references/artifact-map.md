@@ -1,18 +1,18 @@
 # Engine Artifact Map
 
-Default destination root (in this repo):
+Default destination root (canonical Core contracts through the repo symlink):
 
-- `docs/contracts/tv7-axum-engine`
+- `docs/core/contracts/tv7-axum-engine`
 
 Suggested structure:
 
-- `docs/contracts/tv7-axum-engine/openapi/engine-openapi.json`
-- `docs/contracts/tv7-axum-engine/examples/*.json`
-- `docs/contracts/tv7-axum-engine/compatibility/*.md`
+- `docs/core/contracts/tv7-axum-engine/openapi/engine-openapi.json`
+- `docs/core/contracts/tv7-axum-engine/examples/*.json`
+- `docs/core/contracts/tv7-axum-engine/compatibility/*.md`
 
 Shared publication:
 
-- Use `TV7_ENGINE_CONTRACT_DEST_ROOT=<shared-path>` to publish to shared contract trees when authorized.
+- Use `TV7_ENGINE_CONTRACT_DEST_ROOT=<shared-path>` only for nonstandard shared contract destinations.
 
 Rules:
 

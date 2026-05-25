@@ -11,7 +11,7 @@ cd "$repo_root"
 
 source_path="$1"
 artifact_name="${2:-}"
-dest_root="${TV7_ENGINE_CONTRACT_DEST_ROOT:-docs/contracts/tv7-axum-engine}"
+dest_root="${TV7_ENGINE_CONTRACT_DEST_ROOT:-docs/core/contracts/tv7-axum-engine}"
 
 if [[ ! -e "$source_path" ]]; then
   echo "Source path not found: $source_path" >&2

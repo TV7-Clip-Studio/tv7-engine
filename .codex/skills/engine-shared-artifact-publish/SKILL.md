@@ -14,8 +14,8 @@ Update shared artifact files used by other TV7 repos after engine contract chang
 1. Identify source artifact(s) from engine work.
    - Typical sources: generated API schemas, request/response examples, compatibility notes.
 2. Choose destination root.
-   - Default destination root: `docs/contracts/tv7-axum-engine` (in-repo staging).
-   - Optional override via `TV7_ENGINE_CONTRACT_DEST_ROOT` for shared publication paths.
+   - Default destination root: `docs/core/contracts/tv7-axum-engine` (canonical Core contracts via repo symlink).
+   - Optional override via `TV7_ENGINE_CONTRACT_DEST_ROOT` for nonstandard shared publication paths.
    - Keep filenames stable to reduce consumer churn.
 3. Publish artifacts with the helper script.
    - Run `./.codex/skills/engine-shared-artifact-publish/scripts/publish_shared_artifacts.sh <source-path> [artifact-name]`.
@@ -33,6 +33,6 @@ Update shared artifact files used by other TV7 repos after engine contract chang
 
 ## Done Criteria
 
-- Shared artifacts are copied to the intended destination root.
+- Shared artifacts are copied to the intended Core contract destination root.
 - Hashes are captured for review traceability.
 - Cross-repo notes identify impacted consumers.
