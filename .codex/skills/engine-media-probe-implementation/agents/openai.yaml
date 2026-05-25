@@ -1,0 +1,4 @@
+interface:
+  display_name: "Engine Media Probe"
+  short_description: "Replace probe stubs with typed, tested media logic"
+  default_prompt: "Use $engine-media-probe-implementation to implement robust media probing with strong errors and test coverage."

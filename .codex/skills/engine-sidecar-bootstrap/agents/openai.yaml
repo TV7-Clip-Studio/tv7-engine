@@ -1,0 +1,4 @@
+interface:
+  display_name: "Engine Sidecar Bootstrap"
+  short_description: "Scaffold and harden local Axum sidecar startup"
+  default_prompt: "Use $engine-sidecar-bootstrap to implement or refactor the local engine sidecar startup, config, and safety checks."
