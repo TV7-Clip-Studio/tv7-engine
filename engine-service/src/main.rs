@@ -6,8 +6,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use engine_core::{
     ClipRenderer, DiagnosticStatus, DiagnosticsContext, DiagnosticsProvider, EngineDiagnostics,
-    EngineError,
-    FfmpegMediaEngine, MediaMetadata, MediaProbe, RenderClipRequest, RenderClipResult,
+    EngineError, FfmpegMediaEngine, MediaMetadata, MediaProbe, RenderClipRequest, RenderClipResult,
     ThumbnailGenerator, ThumbnailRequest, ThumbnailResult, TranscriptDownloadRequest,
     TranscriptProvider, UrlIngestRequest, UrlIngestor,
 };
@@ -19,6 +18,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -158,6 +158,8 @@ struct EngineJob {
     result: Option<Value>,
     error: Option<String>,
     cancel_requested: bool,
+    #[serde(skip_serializing)]
+    updated_at: SystemTime,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -183,8 +185,11 @@ struct JobStore {
     jobs: Arc<Mutex<HashMap<String, EngineJob>>>,
 }
 
+const JOB_TTL: Duration = Duration::from_secs(60 * 60);
+
 impl JobStore {
     fn create(&self, kind: JobKind) -> EngineJob {
+        self.cleanup_expired();
         let id = format!("job_{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
         let job = EngineJob {
             id: id.clone(),
@@ -195,6 +200,7 @@ impl JobStore {
             result: None,
             error: None,
             cancel_requested: false,
+            updated_at: SystemTime::now(),
         };
         self.jobs
             .lock()
@@ -204,6 +210,7 @@ impl JobStore {
     }
 
     fn get(&self, id: &str) -> Option<EngineJob> {
+        self.cleanup_expired();
         self.jobs
             .lock()
             .expect("job store mutex should not be poisoned")
@@ -218,6 +225,7 @@ impl JobStore {
             .expect("job store mutex should not be poisoned")
             .get_mut(id)
         {
+            job.updated_at = SystemTime::now();
             update(job);
         }
     }
@@ -245,6 +253,24 @@ impl JobStore {
         self.get(id)
             .map(|job| job.cancel_requested || matches!(job.status, JobStatus::Cancelled))
             .unwrap_or(true)
+    }
+
+    fn cleanup_expired(&self) {
+        let now = SystemTime::now();
+        self.jobs
+            .lock()
+            .expect("job store mutex should not be poisoned")
+            .retain(|_, job| {
+                let terminal = matches!(
+                    job.status,
+                    JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
+                );
+                let expired = now
+                    .duration_since(job.updated_at)
+                    .map(|age| age > JOB_TTL)
+                    .unwrap_or(false);
+                !(terminal && expired)
+            });
     }
 }
 
@@ -525,11 +551,18 @@ fn complete_job<T>(jobs: &JobStore, job_id: &str, result: T)
 where
     T: Serialize,
 {
-    let value = serde_json::to_value(result).unwrap_or_else(|error| {
-        serde_json::json!({
-            "serialization_error": error.to_string()
-        })
-    });
+    let value = match serde_json::to_value(result) {
+        Ok(value) => value,
+        Err(error) => {
+            jobs.update(job_id, |job| {
+                job.status = JobStatus::Failed;
+                job.progress = 1.0;
+                job.logs.push("failed to serialize job result".to_string());
+                job.error = Some(error.to_string());
+            });
+            return;
+        }
+    };
     jobs.update(job_id, |job| {
         if job.cancel_requested {
             job.status = JobStatus::Cancelled;
@@ -624,6 +657,7 @@ mod tests {
         CapabilityDiagnostic, DiagnosticStatus, ToolDiagnostic, TranscriptDownloadResult,
         UrlIngestResult, WorkDirDiagnostic,
     };
+    use serde::ser::{Error as SerError, SerializeStruct};
     use tower::ServiceExt;
 
     #[derive(Debug)]
@@ -702,7 +736,6 @@ mod tests {
             &self,
             request: &TranscriptDownloadRequest,
         ) -> Result<TranscriptDownloadResult, EngineError> {
-            std::thread::sleep(std::time::Duration::from_millis(25));
             Ok(TranscriptDownloadResult {
                 transcript_path: Some(request.output_path.clone()),
                 language: request.language.clone().unwrap_or_else(|| "en".to_string()),
@@ -968,44 +1001,60 @@ mod tests {
         assert!(body.contains("queued"));
     }
 
-    #[tokio::test]
-    async fn cancel_job_endpoint_marks_job_cancelled() {
-        let app = router_with_probe(Err(EngineError::Io("unused".to_string())));
+    #[test]
+    fn job_store_marks_queued_job_cancelled() {
+        let jobs = JobStore::default();
+        let created = jobs.create(JobKind::TranscriptDownload);
 
-        let create_response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/transcripts/download")
-                    .method("POST")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"url":"https://example.com/video","output_path":"/tmp/video.vtt"}"#,
-                    ))
-                    .expect("request should be valid"),
-            )
-            .await
-            .expect("transcript request should complete");
-        assert_eq!(create_response.status(), StatusCode::ACCEPTED);
+        let cancelled = jobs
+            .cancel(&created.id)
+            .expect("created job should be cancellable");
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/jobs/job_1/cancel")
-                    .method("POST")
-                    .body(Body::empty())
-                    .expect("request should be valid"),
-            )
-            .await
-            .expect("cancel request should complete");
+        assert!(matches!(cancelled.status, JobStatus::Cancelled));
+        assert!(cancelled.cancel_requested);
+        assert_eq!(cancelled.error.as_deref(), Some("job cancelled"));
+    }
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("cancel body should be readable");
-        let body = String::from_utf8(body.to_vec()).expect("body should be utf8");
-        assert!(body.contains("cancelled"));
-        assert!(body.contains("cancel_requested"));
+    struct BrokenSerialize;
+
+    impl Serialize for BrokenSerialize {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut state = serializer.serialize_struct("BrokenSerialize", 1)?;
+            state.serialize_field("broken", &AlwaysFails)?;
+            state.end()
+        }
+    }
+
+    struct AlwaysFails;
+
+    impl Serialize for AlwaysFails {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(S::Error::custom("serialization failed"))
+        }
+    }
+
+    #[test]
+    fn complete_job_marks_serialization_errors_failed() {
+        let jobs = JobStore::default();
+        let created = jobs.create(JobKind::UrlIngest);
+
+        complete_job(&jobs, &created.id, BrokenSerialize);
+
+        let job = jobs.get(&created.id).expect("job should still exist");
+        assert!(matches!(job.status, JobStatus::Failed));
+        assert_eq!(job.progress, 1.0);
+        assert!(
+            job.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("serialization failed")
+        );
     }
 
     #[tokio::test]

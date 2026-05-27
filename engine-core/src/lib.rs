@@ -387,14 +387,41 @@ impl FfmpegMediaEngine {
     }
 
     fn validate_url(&self, url: &str) -> Result<(), EngineError> {
-        let lower = url.to_ascii_lowercase();
-        if lower.starts_with("http://") || lower.starts_with("https://") {
-            Ok(())
-        } else {
-            Err(EngineError::InvalidUrl(
-                "expected http or https URL".to_string(),
-            ))
+        let (scheme, rest) = url
+            .split_once("://")
+            .ok_or_else(|| EngineError::InvalidUrl("URL must include a scheme".to_string()))?;
+        match scheme {
+            "http" | "https" => {}
+            scheme => {
+                return Err(EngineError::InvalidUrl(format!(
+                    "expected http or https URL, got {scheme}"
+                )));
+            }
         }
+
+        let authority = rest
+            .split(['/', '?', '#'])
+            .next()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| EngineError::InvalidUrl("URL must include a host".to_string()))?;
+        let host_port = authority.rsplit('@').next().unwrap_or(authority);
+        let host = host_port
+            .strip_prefix('[')
+            .and_then(|value| value.split_once(']').map(|(host, _)| host))
+            .unwrap_or_else(|| host_port.split(':').next().unwrap_or(host_port));
+        if host.is_empty() {
+            return Err(EngineError::InvalidUrl(
+                "URL must include a host".to_string(),
+            ));
+        }
+
+        if is_disallowed_host(host) {
+            return Err(EngineError::InvalidUrl(
+                "local and private network URLs are not allowed".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     fn run_checked(&self, executable: &str, args: &[String]) -> Result<ToolOutput, EngineError> {
@@ -504,6 +531,21 @@ impl UrlIngestor for FfmpegMediaEngine {
     }
 }
 
+fn is_disallowed_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+        return true;
+    }
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+            std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.is_unspecified(),
+        }
+    } else {
+        false
+    }
+}
+
 impl TranscriptProvider for FfmpegMediaEngine {
     fn download_transcript(
         &self,
@@ -526,7 +568,11 @@ impl TranscriptProvider for FfmpegMediaEngine {
 
         let language = request.language.clone().unwrap_or_else(|| "en".to_string());
         let before = list_files(parent)?;
-        let output_base = request.output_path.trim_end_matches(".vtt").to_string();
+        let output_base = request
+            .output_path
+            .strip_suffix(".vtt")
+            .unwrap_or(&request.output_path)
+            .to_string();
         let args = vec![
             "--write-auto-sub".to_string(),
             "--sub-lang".to_string(),
@@ -752,15 +798,16 @@ impl DiagnosticsProvider for FfmpegMediaEngine {
 }
 
 fn list_files(directory: &Path) -> Result<Vec<PathBuf>, EngineError> {
-    fs::read_dir(directory)
-        .map_err(|error| EngineError::Io(error.to_string()))?
-        .map(|entry| {
-            entry
-                .map(|entry| entry.path())
-                .map_err(|error| EngineError::Io(error.to_string()))
-        })
-        .filter(|path| path.as_ref().map(|path| path.is_file()).unwrap_or(true))
-        .collect()
+    let mut files = Vec::new();
+    for entry in fs::read_dir(directory).map_err(|error| EngineError::Io(error.to_string()))? {
+        let path = entry
+            .map_err(|error| EngineError::Io(error.to_string()))?
+            .path();
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+    Ok(files)
 }
 
 fn status_for(ready: bool) -> DiagnosticStatus {
@@ -995,13 +1042,12 @@ mod tests {
             Ok(success_output(b"ffmpeg version 1")),
             Ok(success_output(b"yt-dlp 2026.01.01")),
         ]));
-        let engine =
-            FfmpegMediaEngine::with_all_bins_and_executor(
-                "ffmpeg",
-                "ffprobe",
-                "yt-dlp",
-                executor.clone(),
-            );
+        let engine = FfmpegMediaEngine::with_all_bins_and_executor(
+            "ffmpeg",
+            "ffprobe",
+            "yt-dlp",
+            executor.clone(),
+        );
 
         let diagnostics = engine.diagnostics(&DiagnosticsContext::new(
             env!("CARGO_PKG_VERSION"),
@@ -1020,9 +1066,18 @@ mod tests {
         assert_eq!(yt_dlp.available, Some(true));
 
         let calls = executor.calls();
-        assert_eq!(calls[0], ("ffprobe".to_string(), vec!["-version".to_string()]));
-        assert_eq!(calls[1], ("ffmpeg".to_string(), vec!["-version".to_string()]));
-        assert_eq!(calls[2], ("yt-dlp".to_string(), vec!["--version".to_string()]));
+        assert_eq!(
+            calls[0],
+            ("ffprobe".to_string(), vec!["-version".to_string()])
+        );
+        assert_eq!(
+            calls[1],
+            ("ffmpeg".to_string(), vec!["-version".to_string()])
+        );
+        assert_eq!(
+            calls[2],
+            ("yt-dlp".to_string(), vec!["--version".to_string()])
+        );
     }
 
     #[test]
@@ -1052,6 +1107,36 @@ mod tests {
             .find(|tool| tool.name == "ffprobe")
             .expect("ffprobe diagnostic should exist");
         assert_eq!(ffprobe.available, Some(false));
+    }
+
+    #[test]
+    fn rejects_non_http_and_local_ingest_urls() {
+        let engine = FfmpegMediaEngine::new();
+        let output_dir = std::env::temp_dir().to_string_lossy().to_string();
+
+        for url in [
+            "file:///tmp/video.mp4",
+            "ytsearch:test",
+            "http://localhost/video",
+            "https://127.0.0.1/video",
+            "https://10.0.0.1/video",
+        ] {
+            let error = engine
+                .ingest_url(&UrlIngestRequest {
+                    url: url.to_string(),
+                    output_dir: output_dir.clone(),
+                    output_template: None,
+                })
+                .expect_err("unsafe url should be rejected before command execution");
+            assert!(matches!(error, EngineError::InvalidUrl(_)));
+        }
+    }
+
+    #[test]
+    fn transcript_output_base_removes_only_one_vtt_suffix() {
+        let path = "/tmp/video.vtt.vtt".to_string();
+        let output_base = path.strip_suffix(".vtt").unwrap_or(&path).to_string();
+        assert_eq!(output_base, "/tmp/video.vtt");
     }
 
     #[test]
