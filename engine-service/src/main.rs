@@ -15,6 +15,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -276,7 +277,10 @@ impl JobStore {
     }
 
     fn enforce_job_limit(&self, limit: usize) {
-        let mut jobs = self.jobs.lock().expect("job store mutex should not be poisoned");
+        let mut jobs = self
+            .jobs
+            .lock()
+            .expect("job store mutex should not be poisoned");
         if jobs.len() <= limit {
             return;
         }
@@ -502,18 +506,19 @@ async fn start_url_ingest(
     let job_id = job.id.clone();
     let jobs = state.jobs.clone();
     let ingestor = state.url_ingestor.clone();
-    tokio::task::spawn_blocking(move || {
-        if jobs.is_cancel_requested(&job_id) {
+    let task_jobs = jobs.clone();
+    spawn_blocking_job(jobs, job_id.clone(), move || {
+        if task_jobs.is_cancel_requested(&job_id) {
             return;
         }
-        jobs.update(&job_id, |job| {
+        task_jobs.update(&job_id, |job| {
             job.status = JobStatus::Running;
             job.progress = 0.1;
             job.logs.push("started url ingest".to_string());
         });
         match ingestor.ingest_url(&payload) {
-            Ok(result) => complete_job(&jobs, &job_id, result),
-            Err(error) => fail_job(&jobs, &job_id, error),
+            Ok(result) => complete_job(&task_jobs, &job_id, result),
+            Err(error) => fail_job(&task_jobs, &job_id, error),
         }
     });
 
@@ -528,18 +533,19 @@ async fn start_transcript_download(
     let job_id = job.id.clone();
     let jobs = state.jobs.clone();
     let transcript_provider = state.transcript_provider.clone();
-    tokio::task::spawn_blocking(move || {
-        if jobs.is_cancel_requested(&job_id) {
+    let task_jobs = jobs.clone();
+    spawn_blocking_job(jobs, job_id.clone(), move || {
+        if task_jobs.is_cancel_requested(&job_id) {
             return;
         }
-        jobs.update(&job_id, |job| {
+        task_jobs.update(&job_id, |job| {
             job.status = JobStatus::Running;
             job.progress = 0.1;
             job.logs.push("started transcript download".to_string());
         });
         match transcript_provider.download_transcript(&payload) {
-            Ok(result) => complete_job(&jobs, &job_id, result),
-            Err(error) => fail_job(&jobs, &job_id, error),
+            Ok(result) => complete_job(&task_jobs, &job_id, result),
+            Err(error) => fail_job(&task_jobs, &job_id, error),
         }
     });
 
@@ -583,6 +589,14 @@ async fn cancel_job(
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "JOB_NOT_FOUND", "job not found"))
 }
 
+fn spawn_blocking_job(job_store: JobStore, job_id: String, run: impl FnOnce() + Send + 'static) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(run)) {
+            fail_job_panic(&job_store, &job_id, panic_payload_message(payload));
+        }
+    });
+}
+
 fn complete_job<T>(jobs: &JobStore, job_id: &str, result: T)
 where
     T: Serialize,
@@ -612,6 +626,32 @@ where
         job.logs.push("completed".to_string());
         job.result = Some(value);
     });
+}
+
+fn fail_job_panic(jobs: &JobStore, job_id: &str, message: String) {
+    jobs.update(job_id, |job| {
+        if job.cancel_requested {
+            job.status = JobStatus::Cancelled;
+            job.progress = 1.0;
+            job.logs
+                .push("panicked after cancellation request".to_string());
+            return;
+        }
+        job.status = JobStatus::Failed;
+        job.progress = 1.0;
+        job.logs.push("failed after task panic".to_string());
+        job.error = Some(format!("job task panicked: {message}"));
+    });
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
 }
 
 fn fail_job(jobs: &JobStore, job_id: &str, error: EngineError) {
@@ -764,6 +804,15 @@ mod tests {
                 media_path: Some("/tmp/video.mp4".to_string()),
                 metadata: serde_json::json!({"title": "Test Video"}),
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanicUrlIngestor;
+
+    impl UrlIngestor for PanicUrlIngestor {
+        fn ingest_url(&self, _request: &UrlIngestRequest) -> Result<UrlIngestResult, EngineError> {
+            panic!("ingest panic")
         }
     }
 
@@ -1035,6 +1084,83 @@ mod tests {
             .expect("logs body should be readable");
         let body = String::from_utf8(body.to_vec()).expect("body should be utf8");
         assert!(body.contains("queued"));
+    }
+
+    #[tokio::test]
+    async fn panicked_blocking_job_is_marked_failed() {
+        let mock = Arc::new(MockMediaProbe {
+            probe_response: Err(EngineError::Io("unused".to_string())),
+            thumbnail_response: Ok(ThumbnailResult {
+                output_path: "/tmp/thumb.jpg".to_string(),
+            }),
+            render_response: Ok(RenderClipResult {
+                output_path: "/tmp/clip.mp4".to_string(),
+                duration_seconds: 10.0,
+            }),
+        });
+        let app = build_router(AppState {
+            media_probe: mock.clone(),
+            thumbnail_generator: mock.clone(),
+            clip_renderer: mock.clone(),
+            url_ingestor: Arc::new(PanicUrlIngestor),
+            transcript_provider: mock.clone(),
+            diagnostics_provider: mock,
+            jobs: JobStore::default(),
+            diagnostics_context: DiagnosticsContext::new(
+                env!("CARGO_PKG_VERSION"),
+                "127.0.0.1",
+                7070,
+                std::env::temp_dir(),
+            ),
+        });
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/ingest/url")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"url":"https://example.com/video","output_dir":"/tmp"}"#,
+                    ))
+                    .expect("request should be valid"),
+            )
+            .await
+            .expect("ingest request should complete");
+        assert_eq!(create_response.status(), StatusCode::ACCEPTED);
+
+        let mut job_body = serde_json::Value::Null;
+        for _ in 0..20 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/jobs/job_1")
+                        .method("GET")
+                        .body(Body::empty())
+                        .expect("request should be valid"),
+                )
+                .await
+                .expect("job request should complete");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("job body should be readable");
+            job_body = serde_json::from_slice(&body).expect("job body should be json");
+            if job_body["status"] == "failed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(job_body["status"], "failed");
+        assert!(
+            job_body["error"]
+                .as_str()
+                .expect("failed job should include an error")
+                .contains("job task panicked")
+        );
     }
 
     #[test]

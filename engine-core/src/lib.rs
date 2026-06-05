@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
 use std::fs;
+use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -539,11 +540,19 @@ fn is_disallowed_host(host: &str) -> bool {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         match ip {
             std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
-            std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.is_unspecified(),
+            std::net::IpAddr::V6(ip) => is_disallowed_ipv6(ip),
         }
     } else {
         false
     }
+}
+
+fn is_disallowed_ipv6(ip: Ipv6Addr) -> bool {
+    let first_segment = ip.segments()[0];
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || (first_segment & 0xfe00) == 0xfc00
+        || (first_segment & 0xffc0) == 0xfe80
 }
 
 impl TranscriptProvider for FfmpegMediaEngine {
@@ -930,12 +939,17 @@ mod tests {
         }
     }
 
+    static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn unique_temp_file_path(extension: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be valid")
             .as_nanos();
-        std::env::temp_dir().join(format!("tv7-engine-test-{nanos}.{extension}"))
+        let counter = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let process_id = std::process::id();
+        std::env::temp_dir()
+            .join(format!("tv7-engine-test-{process_id}-{nanos}-{counter}.{extension}"))
     }
 
     fn ffmpeg_available() -> bool {
@@ -1120,6 +1134,9 @@ mod tests {
             "http://localhost/video",
             "https://127.0.0.1/video",
             "https://10.0.0.1/video",
+            "https://[fc00::1]/video",
+            "https://[fd12:3456:789a::1]/video",
+            "https://[fe80::1]/video",
         ] {
             let error = engine
                 .ingest_url(&UrlIngestRequest {
