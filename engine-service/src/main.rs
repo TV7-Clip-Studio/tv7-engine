@@ -186,11 +186,12 @@ struct JobStore {
 }
 
 const JOB_TTL: Duration = Duration::from_secs(60 * 60);
+const MAX_JOBS: usize = 1_000;
 
 impl JobStore {
     fn create(&self, kind: JobKind) -> EngineJob {
         self.cleanup_expired();
-        let id = format!("job_{}", self.next_id.fetch_add(1, Ordering::Relaxed) + 1);
+        let id = format!("job_{}", self.next_id.fetch_add(1, Ordering::SeqCst) + 1);
         let job = EngineJob {
             id: id.clone(),
             kind,
@@ -206,6 +207,7 @@ impl JobStore {
             .lock()
             .expect("job store mutex should not be poisoned")
             .insert(id, job.clone());
+        self.enforce_job_limit(MAX_JOBS);
         job
     }
 
@@ -271,6 +273,40 @@ impl JobStore {
                     .unwrap_or(false);
                 !(terminal && expired)
             });
+    }
+
+    fn enforce_job_limit(&self, limit: usize) {
+        let mut jobs = self.jobs.lock().expect("job store mutex should not be poisoned");
+        if jobs.len() <= limit {
+            return;
+        }
+
+        if limit == 0 {
+            jobs.clear();
+            return;
+        }
+
+        let mut candidates: Vec<_> = jobs
+            .iter()
+            .map(|(id, job)| {
+                let terminal = matches!(
+                    job.status,
+                    JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
+                );
+                let updated_at = job
+                    .updated_at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default();
+                (id.clone(), terminal, updated_at)
+            })
+            .collect();
+
+        candidates.sort_by_key(|(_, terminal, updated_at)| (!*terminal, *updated_at));
+
+        let remove_count = jobs.len() - limit;
+        for (id, _, _) in candidates.into_iter().take(remove_count) {
+            jobs.remove(&id);
+        }
     }
 }
 
@@ -1013,6 +1049,61 @@ mod tests {
         assert!(matches!(cancelled.status, JobStatus::Cancelled));
         assert!(cancelled.cancel_requested);
         assert_eq!(cancelled.error.as_deref(), Some("job cancelled"));
+    }
+
+    #[test]
+    fn job_store_limit_removes_terminal_jobs_first() {
+        let jobs = JobStore::default();
+        let terminal = jobs.create(JobKind::UrlIngest);
+        let running = jobs.create(JobKind::UrlIngest);
+        let queued_a = jobs.create(JobKind::TranscriptDownload);
+        let queued_b = jobs.create(JobKind::TranscriptDownload);
+
+        jobs.update(&terminal.id, |job| {
+            job.status = JobStatus::Succeeded;
+            job.updated_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        });
+        jobs.update(&running.id, |job| {
+            job.status = JobStatus::Running;
+            job.updated_at = SystemTime::UNIX_EPOCH + Duration::from_secs(2);
+        });
+        jobs.update(&queued_a.id, |job| {
+            job.updated_at = SystemTime::UNIX_EPOCH + Duration::from_secs(3);
+        });
+        jobs.update(&queued_b.id, |job| {
+            job.updated_at = SystemTime::UNIX_EPOCH + Duration::from_secs(4);
+        });
+
+        jobs.enforce_job_limit(3);
+
+        assert!(jobs.get(&terminal.id).is_none());
+        assert!(jobs.get(&running.id).is_some());
+        assert!(jobs.get(&queued_a.id).is_some());
+        assert!(jobs.get(&queued_b.id).is_some());
+    }
+
+    #[test]
+    fn job_store_limit_bounds_non_terminal_jobs() {
+        let jobs = JobStore::default();
+        let oldest = jobs.create(JobKind::UrlIngest);
+        let middle = jobs.create(JobKind::UrlIngest);
+        let newest = jobs.create(JobKind::TranscriptDownload);
+
+        jobs.update(&oldest.id, |job| {
+            job.updated_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        });
+        jobs.update(&middle.id, |job| {
+            job.updated_at = SystemTime::UNIX_EPOCH + Duration::from_secs(2);
+        });
+        jobs.update(&newest.id, |job| {
+            job.updated_at = SystemTime::UNIX_EPOCH + Duration::from_secs(3);
+        });
+
+        jobs.enforce_job_limit(2);
+
+        assert!(jobs.get(&oldest.id).is_none());
+        assert!(jobs.get(&middle.id).is_some());
+        assert!(jobs.get(&newest.id).is_some());
     }
 
     struct BrokenSerialize;
