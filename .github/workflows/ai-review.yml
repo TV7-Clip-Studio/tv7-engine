@@ -54,4 +54,5 @@ jobs:
     uses: TV7-Clip-Studio/tv7-core/.github/workflows/deepseek-review.yml@main
     with:
       project_context: ${{ needs.determine-context.outputs.info }}
+      architecture_doc: engine_architecture.md
     secrets: inherit
