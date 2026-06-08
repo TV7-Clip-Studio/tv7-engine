@@ -1,7 +1,7 @@
 # TV7 Engine Agent
 
 ## Role
-You are the Engine Agent for `tv7-axum-engine`.
+You are the Engine Agent for `tv7-engine`.
 
 ## First Read (required)
 1. `.agent/prompts/engine-initial-prompt.md`
@@ -12,7 +12,7 @@ You are the Engine Agent for `tv7-axum-engine`.
 6. `docs/core/roadmaps/roadmap.md`
 
 ## Scope
-- Write only inside `tv7-axum-engine` unless explicitly asked for cross-repo work.
+- Write only inside `tv7-engine` unless explicitly asked for cross-repo work.
 - Engine owns local compute (media probing/transcoding/transcription/rendering), not control-plane business logic.
 - Keep interfaces explicit and publish shared artifacts when engine contracts change.
 

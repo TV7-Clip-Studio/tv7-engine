@@ -55,9 +55,39 @@ struct AppConfig {
 
 impl AppConfig {
     fn from_env() -> Result<Self> {
-        let host = env::var("TV7_ENGINE_HOST")
-            .ok()
-            .map(|value| value.parse::<IpAddr>())
+        let host = env::var("TV7_ENGINE_HOST").ok();
+        let port = env::var("TV7_ENGINE_PORT").ok();
+        let log_level = env::var("TV7_ENGINE_LOG_LEVEL").ok();
+        let ffmpeg_bin = env::var("TV7_ENGINE_FFMPEG_BIN").ok();
+        let ffprobe_bin = env::var("TV7_ENGINE_FFPROBE_BIN").ok();
+        let yt_dlp_bin = env::var("TV7_ENGINE_YT_DLP_BIN").ok();
+        let work_dir = match env::var("TV7_ENGINE_WORK_DIR") {
+            Ok(value) => PathBuf::from(value),
+            Err(_) => env::current_dir().context("failed to resolve current directory")?,
+        };
+
+        Self::from_values(
+            host.as_deref(),
+            port.as_deref(),
+            log_level.as_deref(),
+            work_dir,
+            ffmpeg_bin.as_deref(),
+            ffprobe_bin.as_deref(),
+            yt_dlp_bin.as_deref(),
+        )
+    }
+
+    fn from_values(
+        host: Option<&str>,
+        port: Option<&str>,
+        log_level: Option<&str>,
+        work_dir: PathBuf,
+        ffmpeg_bin: Option<&str>,
+        ffprobe_bin: Option<&str>,
+        yt_dlp_bin: Option<&str>,
+    ) -> Result<Self> {
+        let host = host
+            .map(str::parse::<IpAddr>)
             .transpose()
             .context("TV7_ENGINE_HOST must be a valid ip address")?
             .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
@@ -66,22 +96,16 @@ impl AppConfig {
             anyhow::bail!("TV7_ENGINE_HOST must be loopback, got {host}");
         }
 
-        let port = env::var("TV7_ENGINE_PORT")
-            .ok()
-            .map(|value| value.parse::<u16>())
+        let port = port
+            .map(str::parse::<u16>)
             .transpose()
             .context("TV7_ENGINE_PORT must be a valid u16 port")?
             .unwrap_or(7070);
 
-        let log_level = env::var("TV7_ENGINE_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
-        let ffmpeg_bin = env::var("TV7_ENGINE_FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".to_string());
-        let ffprobe_bin =
-            env::var("TV7_ENGINE_FFPROBE_BIN").unwrap_or_else(|_| "ffprobe".to_string());
-        let yt_dlp_bin = env::var("TV7_ENGINE_YT_DLP_BIN").unwrap_or_else(|_| "yt-dlp".to_string());
-        let work_dir = match env::var("TV7_ENGINE_WORK_DIR") {
-            Ok(value) => PathBuf::from(value),
-            Err(_) => env::current_dir().context("failed to resolve current directory")?,
-        };
+        let log_level = log_level.unwrap_or("info").to_string();
+        let ffmpeg_bin = ffmpeg_bin.unwrap_or("ffmpeg").to_string();
+        let ffprobe_bin = ffprobe_bin.unwrap_or("ffprobe").to_string();
+        let yt_dlp_bin = yt_dlp_bin.unwrap_or("yt-dlp").to_string();
 
         if !work_dir.is_absolute() {
             anyhow::bail!(
@@ -734,6 +758,7 @@ mod tests {
         UrlIngestResult, WorkDirDiagnostic,
     };
     use serde::ser::{Error as SerError, SerializeStruct};
+    use std::collections::BTreeSet;
     use tower::ServiceExt;
 
     #[derive(Debug)]
@@ -816,6 +841,22 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct SlowTranscriptProvider;
+
+    impl TranscriptProvider for SlowTranscriptProvider {
+        fn download_transcript(
+            &self,
+            request: &TranscriptDownloadRequest,
+        ) -> Result<TranscriptDownloadResult, EngineError> {
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(TranscriptDownloadResult {
+                transcript_path: Some(request.output_path.clone()),
+                language: request.language.clone().unwrap_or_else(|| "en".to_string()),
+            })
+        }
+    }
+
     impl TranscriptProvider for MockMediaProbe {
         fn download_transcript(
             &self,
@@ -854,6 +895,288 @@ mod tests {
                 std::env::temp_dir(),
             ),
         })
+    }
+
+    fn engine_openapi() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../docs/core/contracts/openapi/tv7-engine/openapi.json"
+        ))
+        .expect("engine openapi contract should be valid json")
+    }
+
+    fn success_statuses_for(
+        openapi: &serde_json::Value,
+        path: &str,
+        method: &str,
+    ) -> BTreeSet<u16> {
+        openapi["paths"][path][method]["responses"]
+            .as_object()
+            .expect("operation responses should be an object")
+            .keys()
+            .filter_map(|status| status.parse::<u16>().ok())
+            .filter(|status| (200..300).contains(status))
+            .collect()
+    }
+
+    async fn request_json(
+        app: Router,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = Request::builder().uri(uri).method(method);
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let request_body = body
+            .map(|body| Body::from(body.to_string()))
+            .unwrap_or_else(Body::empty);
+        let response = app
+            .oneshot(builder.body(request_body).expect("request should be valid"))
+            .await
+            .expect("request should complete");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let json = serde_json::from_slice(&body).expect("response body should be json");
+        (status, json)
+    }
+
+    #[test]
+    fn openapi_contract_declares_every_runtime_route() {
+        let openapi = engine_openapi();
+        let paths = openapi["paths"]
+            .as_object()
+            .expect("paths should be an object");
+        let actual_routes = BTreeSet::from([
+            "/health",
+            "/v1/diagnostics",
+            "/v1/media/probe",
+            "/v1/media/thumbnail",
+            "/v1/media/render-clip",
+            "/v1/ingest/url",
+            "/v1/transcripts/download",
+            "/v1/jobs/{id}",
+            "/v1/jobs/{id}/logs",
+            "/v1/jobs/{id}/cancel",
+        ]);
+        let contract_routes = paths.keys().map(String::as_str).collect::<BTreeSet<_>>();
+
+        assert_eq!(contract_routes, actual_routes);
+    }
+
+    #[tokio::test]
+    async fn runtime_success_statuses_match_openapi_contract() {
+        let openapi = engine_openapi();
+        let app = router_with_probe(Ok(MediaMetadata {
+            path: "/tmp/file.mp4".to_string(),
+            duration_seconds: Some(10.0),
+            width: Some(1920),
+            height: Some(1080),
+            format: "mp4".to_string(),
+            size_bytes: 1024,
+        }));
+
+        let cases = [
+            ("get", "/health", "GET", "/health", None),
+            ("get", "/v1/diagnostics", "GET", "/v1/diagnostics", None),
+            (
+                "post",
+                "/v1/media/probe",
+                "POST",
+                "/v1/media/probe",
+                Some(r#"{"path":"/tmp/file.mp4"}"#),
+            ),
+            (
+                "post",
+                "/v1/media/thumbnail",
+                "POST",
+                "/v1/media/thumbnail",
+                Some(
+                    r#"{"source_path":"/tmp/video.mp4","output_path":"/tmp/thumb.jpg","timestamp_seconds":1.0}"#,
+                ),
+            ),
+            (
+                "post",
+                "/v1/media/render-clip",
+                "POST",
+                "/v1/media/render-clip",
+                Some(
+                    r#"{"source_path":"/tmp/video.mp4","output_path":"/tmp/clip.mp4","start_seconds":1.0,"end_seconds":11.0}"#,
+                ),
+            ),
+            (
+                "post",
+                "/v1/ingest/url",
+                "POST",
+                "/v1/ingest/url",
+                Some(r#"{"url":"https://example.com/video","output_dir":"/tmp"}"#),
+            ),
+            (
+                "post",
+                "/v1/transcripts/download",
+                "POST",
+                "/v1/transcripts/download",
+                Some(
+                    r#"{"url":"https://example.com/video","output_path":"/tmp/video.vtt","language":"en"}"#,
+                ),
+            ),
+        ];
+
+        for (contract_method, contract_path, request_method, request_uri, request_body) in cases {
+            let (status, body) =
+                request_json(app.clone(), request_method, request_uri, request_body).await;
+            assert!(
+                success_statuses_for(&openapi, contract_path, contract_method)
+                    .contains(&status.as_u16()),
+                "{request_method} {request_uri} returned {status}, body {body}"
+            );
+        }
+
+        for (contract_method, contract_path, request_method, request_uri) in [
+            ("get", "/v1/jobs/{id}", "GET", "/v1/jobs/job_1"),
+            ("get", "/v1/jobs/{id}/logs", "GET", "/v1/jobs/job_1/logs"),
+            (
+                "post",
+                "/v1/jobs/{id}/cancel",
+                "POST",
+                "/v1/jobs/job_1/cancel",
+            ),
+        ] {
+            let (status, body) = request_json(app.clone(), request_method, request_uri, None).await;
+            assert!(
+                success_statuses_for(&openapi, contract_path, contract_method)
+                    .contains(&status.as_u16()),
+                "{request_method} {request_uri} returned {status}, body {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_success_payloads_include_openapi_required_keys() {
+        let app = router_with_probe(Ok(MediaMetadata {
+            path: "/tmp/file.mp4".to_string(),
+            duration_seconds: Some(10.0),
+            width: Some(1920),
+            height: Some(1080),
+            format: "mp4".to_string(),
+            size_bytes: 1024,
+        }));
+
+        let (_, health) = request_json(app.clone(), "GET", "/health", None).await;
+        assert!(health.get("status").is_some());
+
+        let (_, diagnostics) = request_json(app.clone(), "GET", "/v1/diagnostics", None).await;
+        for key in ["status", "runtime", "capabilities", "tools", "work_dir"] {
+            assert!(diagnostics.get(key).is_some(), "missing diagnostics.{key}");
+        }
+
+        let (_, probe) = request_json(
+            app.clone(),
+            "POST",
+            "/v1/media/probe",
+            Some(r#"{"path":"/tmp/file.mp4"}"#),
+        )
+        .await;
+        for key in [
+            "path",
+            "duration_seconds",
+            "width",
+            "height",
+            "format",
+            "size_bytes",
+        ] {
+            assert!(
+                probe["metadata"].get(key).is_some(),
+                "missing metadata.{key}"
+            );
+        }
+
+        let (_, thumbnail) = request_json(
+            app.clone(),
+            "POST",
+            "/v1/media/thumbnail",
+            Some(
+                r#"{"source_path":"/tmp/video.mp4","output_path":"/tmp/thumb.jpg","timestamp_seconds":1.0}"#,
+            ),
+        )
+        .await;
+        assert!(thumbnail["result"].get("output_path").is_some());
+
+        let (_, render) = request_json(
+            app.clone(),
+            "POST",
+            "/v1/media/render-clip",
+            Some(
+                r#"{"source_path":"/tmp/video.mp4","output_path":"/tmp/clip.mp4","start_seconds":1.0,"end_seconds":11.0}"#,
+            ),
+        )
+        .await;
+        for key in ["output_path", "duration_seconds"] {
+            assert!(render["result"].get(key).is_some(), "missing result.{key}");
+        }
+
+        let (_, job_create) = request_json(
+            app.clone(),
+            "POST",
+            "/v1/ingest/url",
+            Some(r#"{"url":"https://example.com/video","output_dir":"/tmp"}"#),
+        )
+        .await;
+        for key in [
+            "id",
+            "kind",
+            "status",
+            "progress",
+            "logs",
+            "cancel_requested",
+        ] {
+            assert!(job_create["job"].get(key).is_some(), "missing job.{key}");
+        }
+
+        let (_, logs) = request_json(app, "GET", "/v1/jobs/job_1/logs", None).await;
+        for key in ["job_id", "logs"] {
+            assert!(logs.get(key).is_some(), "missing logs.{key}");
+        }
+    }
+
+    #[test]
+    fn config_rejects_non_loopback_host() {
+        let error = AppConfig::from_values(
+            Some("0.0.0.0"),
+            Some("7070"),
+            None,
+            std::env::temp_dir(),
+            None,
+            None,
+            None,
+        )
+        .expect_err("non-loopback host should fail");
+
+        assert!(
+            error.to_string().contains("must be loopback"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_relative_work_dir() {
+        let error = AppConfig::from_values(
+            Some("127.0.0.1"),
+            Some("7070"),
+            None,
+            PathBuf::from("relative-work-dir"),
+            None,
+            None,
+            None,
+        )
+        .expect_err("relative work dir should fail");
+
+        assert!(
+            error.to_string().contains("must be an absolute path"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[tokio::test]
@@ -1084,6 +1407,70 @@ mod tests {
             .expect("logs body should be readable");
         let body = String::from_utf8(body.to_vec()).expect("body should be utf8");
         assert!(body.contains("queued"));
+    }
+
+    #[tokio::test]
+    async fn cancel_job_endpoint_marks_job_cancelled() {
+        let mock = Arc::new(MockMediaProbe {
+            probe_response: Err(EngineError::Io("unused".to_string())),
+            thumbnail_response: Ok(ThumbnailResult {
+                output_path: "/tmp/thumb.jpg".to_string(),
+            }),
+            render_response: Ok(RenderClipResult {
+                output_path: "/tmp/clip.mp4".to_string(),
+                duration_seconds: 10.0,
+            }),
+        });
+        let app = build_router(AppState {
+            media_probe: mock.clone(),
+            thumbnail_generator: mock.clone(),
+            clip_renderer: mock.clone(),
+            url_ingestor: mock.clone(),
+            transcript_provider: Arc::new(SlowTranscriptProvider),
+            diagnostics_provider: mock,
+            jobs: JobStore::default(),
+            diagnostics_context: DiagnosticsContext::new(
+                env!("CARGO_PKG_VERSION"),
+                "127.0.0.1",
+                7070,
+                std::env::temp_dir(),
+            ),
+        });
+
+        let create_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/transcripts/download")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"url":"https://example.com/video","output_path":"/tmp/video.vtt","language":"en"}"#,
+                    ))
+                    .expect("request should be valid"),
+            )
+            .await
+            .expect("transcript request should complete");
+        assert_eq!(create_response.status(), StatusCode::ACCEPTED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/jobs/job_1/cancel")
+                    .method("POST")
+                    .body(Body::empty())
+                    .expect("request should be valid"),
+            )
+            .await
+            .expect("cancel request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("cancel body should be readable");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("body should be json");
+        assert_eq!(body["status"], "cancelled");
+        assert_eq!(body["cancel_requested"], true);
     }
 
     #[tokio::test]
