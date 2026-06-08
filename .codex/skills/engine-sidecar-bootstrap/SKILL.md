@@ -35,4 +35,3 @@ Set up a reliable local-first sidecar in `engine-service` that delegates compute
 - Service startup is deterministic and config-driven.
 - Loopback binding and input validation rules are enforced.
 - `cargo check`, `cargo test`, and `cargo clippy` pass.
-

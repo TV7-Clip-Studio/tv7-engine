@@ -948,8 +948,9 @@ mod tests {
             .as_nanos();
         let counter = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let process_id = std::process::id();
-        std::env::temp_dir()
-            .join(format!("tv7-engine-test-{process_id}-{nanos}-{counter}.{extension}"))
+        std::env::temp_dir().join(format!(
+            "tv7-engine-test-{process_id}-{nanos}-{counter}.{extension}"
+        ))
     }
 
     fn ffmpeg_available() -> bool {
@@ -1045,6 +1046,85 @@ mod tests {
             .expect_err("invalid range should fail");
 
         assert!(matches!(error, EngineError::InvalidTimeRange(_)));
+        fs::remove_file(file_path).expect("fixture file should be removed");
+    }
+
+    #[test]
+    fn rejects_output_path_with_missing_parent() {
+        let file_path = unique_temp_file_path("mp4");
+        fs::write(&file_path, b"sample-bytes").expect("fixture file should be created");
+        let missing_output = std::env::temp_dir()
+            .join("tv7-engine-missing-output-parent")
+            .join("thumb.jpg");
+        let engine = FfmpegMediaEngine::new();
+
+        let error = engine
+            .generate_thumbnail(&ThumbnailRequest {
+                source_path: file_path.to_string_lossy().to_string(),
+                output_path: missing_output.to_string_lossy().to_string(),
+                timestamp_seconds: Some(1.0),
+            })
+            .expect_err("missing output parent should fail");
+
+        assert!(matches!(error, EngineError::OutputParentMissing(_)));
+        fs::remove_file(file_path).expect("fixture file should be removed");
+    }
+
+    #[test]
+    fn rejects_source_and_output_same_path() {
+        let file_path = unique_temp_file_path("mp4");
+        fs::write(&file_path, b"sample-bytes").expect("fixture file should be created");
+        let path = file_path.to_string_lossy().to_string();
+        let engine = FfmpegMediaEngine::new();
+
+        let error = engine
+            .render_clip(&RenderClipRequest {
+                source_path: path.clone(),
+                output_path: path,
+                start_seconds: 0.0,
+                end_seconds: 1.0,
+            })
+            .expect_err("same source and output should fail");
+
+        assert!(matches!(error, EngineError::SourceOutputSame(_)));
+        fs::remove_file(file_path).expect("fixture file should be removed");
+    }
+
+    #[test]
+    fn maps_nonzero_command_exit_to_command_failed() {
+        let file_path = unique_temp_file_path("mp4");
+        fs::write(&file_path, b"sample-bytes").expect("fixture file should be created");
+        let executor = Arc::new(MockExecutor::new(vec![Ok(ToolOutput {
+            status_success: false,
+            stdout: Vec::new(),
+            stderr: b"ffprobe failed".to_vec(),
+        })]));
+        let engine = FfmpegMediaEngine::with_executor("ffmpeg", "ffprobe", executor);
+
+        let error = engine
+            .probe_path(&file_path)
+            .expect_err("nonzero command should fail");
+
+        assert!(matches!(
+            error,
+            EngineError::CommandFailed { command, message }
+                if command == "ffprobe" && message == "ffprobe failed"
+        ));
+        fs::remove_file(file_path).expect("fixture file should be removed");
+    }
+
+    #[test]
+    fn maps_malformed_ffprobe_json_to_output_invalid() {
+        let file_path = unique_temp_file_path("mp4");
+        fs::write(&file_path, b"sample-bytes").expect("fixture file should be created");
+        let executor = Arc::new(MockExecutor::new(vec![Ok(success_output(b"not json"))]));
+        let engine = FfmpegMediaEngine::with_executor("ffmpeg", "ffprobe", executor);
+
+        let error = engine
+            .probe_path(&file_path)
+            .expect_err("malformed ffprobe json should fail");
+
+        assert!(matches!(error, EngineError::OutputInvalid(_)));
         fs::remove_file(file_path).expect("fixture file should be removed");
     }
 

@@ -4,8 +4,8 @@ Local-first engine that powers media and AI workloads for the TV7 app. The codeb
 
 ## Docs
 - `docs/core/architecture/engine_architecture.md` – core responsibilities and non-goals.
-- `docs/core/roadmaps/tv7-axum-engine-roadmap.md` – phased engine roadmap.
-- `docs/core/contracts/openapi/tv7-axum-engine/openapi.json` – canonical local engine HTTP contract artifact.
+- `docs/core/roadmaps/tv7-engine-roadmap.md` – phased engine roadmap.
+- `docs/core/contracts/openapi/tv7-engine/openapi.json` – canonical local engine HTTP contract artifact.
 
 ## Current Status
 - Initial local HTTP surface is implemented in `engine-service`:
@@ -16,7 +16,7 @@ Local-first engine that powers media and AI workloads for the TV7 app. The codeb
   - `POST /v1/media/render-clip`
 - Engine computes locally only; no business logic or cloud calls belong here.
 - Loopback-only surface; inputs must use absolute paths.
-- Studio migration details live in `docs/core/contracts/tv7-axum-engine/studio-sidecar-migration.md`.
+- Studio migration details live in `docs/core/contracts/tv7-engine/studio-sidecar-migration.md`.
 
 ## Run Locally
 ```bash
@@ -35,4 +35,17 @@ Environment variables:
 Useful commands:
 - `make check` - compile workspace checks.
 - `make test` - run unit tests.
+- `make clippy` - run strict clippy checks.
+- `make quality` - run the full quality gate enforced before commits.
 - `make lint` - apply format + clippy fixes.
+
+## Commit Checks
+Install the local commit gate once:
+```bash
+pipx install pre-commit
+cargo install cargo-audit --version 0.22.1 --locked
+cargo install cargo-deny --version 0.18.3 --locked
+pre-commit install
+```
+
+Every commit runs formatting, compile checks, tests, clippy, dependency advisories via `cargo audit`, dependency license/source policy via `cargo deny`, and basic file hygiene. Run `make quality` or `pre-commit run --all-files` to reproduce failures before committing.
