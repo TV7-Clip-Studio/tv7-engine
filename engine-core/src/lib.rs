@@ -72,6 +72,20 @@ pub struct TranscriptDownloadResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptGenerateRequest {
+    pub media_path: String,
+    pub output_path: String,
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptGenerateResult {
+    pub transcript_path: String,
+    pub format: String,
+    pub language: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EngineDiagnostics {
     pub status: DiagnosticStatus,
     pub runtime: RuntimeDiagnostic,
@@ -115,6 +129,157 @@ pub struct RuntimeDiagnostic {
     pub engine_version: String,
     pub host: String,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetupContext {
+    pub platform: String,
+    pub asset_dir: PathBuf,
+    pub whisper_bin: Option<String>,
+    pub whisper_model: Option<PathBuf>,
+    pub ollama_bin: String,
+    pub ollama_model: Option<String>,
+    pub cloud_ai_available: bool,
+}
+
+impl SetupContext {
+    pub fn new(
+        platform: impl Into<String>,
+        asset_dir: impl Into<PathBuf>,
+        whisper_bin: Option<String>,
+        whisper_model: Option<PathBuf>,
+        ollama_bin: impl Into<String>,
+        ollama_model: Option<String>,
+        cloud_ai_available: bool,
+    ) -> Self {
+        Self {
+            platform: platform.into(),
+            asset_dir: asset_dir.into(),
+            whisper_bin,
+            whisper_model,
+            ollama_bin: ollama_bin.into(),
+            ollama_model,
+            cloud_ai_available,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetupManifest {
+    pub schema_version: u32,
+    pub platform: String,
+    pub setup_modes: Vec<String>,
+    pub ai_provider_order: Vec<ProviderSource>,
+    pub assets: Vec<SetupManifestAsset>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetupManifestAsset {
+    pub id: String,
+    pub kind: RuntimeAssetKind,
+    pub name: String,
+    pub required_for: Vec<String>,
+    pub installable: bool,
+    pub bundled: bool,
+    pub source: ProviderSource,
+    pub version: Option<String>,
+    pub download: Option<SetupDownload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetupDownload {
+    pub url: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetupStatus {
+    pub schema_version: u32,
+    pub setup_complete: bool,
+    pub active_ai_provider: Option<ProviderSource>,
+    pub assets: Vec<SetupAssetStatus>,
+    pub ai_providers: Vec<AiProviderCandidate>,
+    pub capabilities: Vec<SetupCapabilityStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetupAssetStatus {
+    pub id: String,
+    pub kind: RuntimeAssetKind,
+    pub name: String,
+    pub status: SetupItemStatus,
+    pub source: ProviderSource,
+    pub path: Option<String>,
+    pub version: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiProviderCandidate {
+    pub source: ProviderSource,
+    pub status: ProviderCandidateStatus,
+    pub required_assets: Vec<String>,
+    pub requires_internet: bool,
+    pub requires_user_confirmation: bool,
+    pub cost_policy: String,
+    pub action: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetupCapabilityStatus {
+    pub name: String,
+    pub status: SetupCapabilityState,
+    pub provider: Option<ProviderSource>,
+    pub missing: Vec<String>,
+    pub installable: bool,
+    pub user_action_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeAssetKind {
+    MediaTool,
+    TranscriptionRuntime,
+    TranscriptionModel,
+    LlmRuntime,
+    LlmModel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSource {
+    UserPath,
+    Tv7Managed,
+    Tv7Cloud,
+    Bundled,
+    Ollama,
+    Unconfigured,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupItemStatus {
+    Available,
+    Missing,
+    Installable,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCandidateStatus {
+    Ready,
+    MissingAssets,
+    Installable,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupCapabilityState {
+    Ready,
+    NotReady,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,6 +402,11 @@ pub trait DiagnosticsProvider: Send + Sync {
     fn diagnostics(&self, context: &DiagnosticsContext) -> EngineDiagnostics;
 }
 
+pub trait RuntimeSetupProvider: Send + Sync {
+    fn setup_manifest(&self, context: &SetupContext) -> SetupManifest;
+    fn setup_status(&self, context: &SetupContext) -> SetupStatus;
+}
+
 pub trait UrlIngestor: Send + Sync {
     fn ingest_url(&self, request: &UrlIngestRequest) -> Result<UrlIngestResult, EngineError>;
 }
@@ -246,6 +416,11 @@ pub trait TranscriptProvider: Send + Sync {
         &self,
         request: &TranscriptDownloadRequest,
     ) -> Result<TranscriptDownloadResult, EngineError>;
+
+    fn generate_transcript(
+        &self,
+        request: &TranscriptGenerateRequest,
+    ) -> Result<TranscriptGenerateResult, EngineError>;
 }
 
 #[derive(Clone)]
@@ -253,6 +428,8 @@ pub struct FfmpegMediaEngine {
     ffmpeg_bin: String,
     ffprobe_bin: String,
     yt_dlp_bin: String,
+    whisper_bin: Option<String>,
+    whisper_model: Option<PathBuf>,
     executor: Arc<dyn CommandExecutor>,
 }
 
@@ -262,6 +439,8 @@ impl fmt::Debug for FfmpegMediaEngine {
             .field("ffmpeg_bin", &self.ffmpeg_bin)
             .field("ffprobe_bin", &self.ffprobe_bin)
             .field("yt_dlp_bin", &self.yt_dlp_bin)
+            .field("whisper_bin", &self.whisper_bin)
+            .field("whisper_model", &self.whisper_model)
             .finish_non_exhaustive()
     }
 }
@@ -278,6 +457,8 @@ impl FfmpegMediaEngine {
             ffmpeg_bin: "ffmpeg".to_string(),
             ffprobe_bin: "ffprobe".to_string(),
             yt_dlp_bin: "yt-dlp".to_string(),
+            whisper_bin: None,
+            whisper_model: None,
             executor: Arc::new(ProcessCommandExecutor),
         }
     }
@@ -287,6 +468,8 @@ impl FfmpegMediaEngine {
             ffmpeg_bin: ffmpeg_bin.into(),
             ffprobe_bin: ffprobe_bin.into(),
             yt_dlp_bin: "yt-dlp".to_string(),
+            whisper_bin: None,
+            whisper_model: None,
             executor: Arc::new(ProcessCommandExecutor),
         }
     }
@@ -300,6 +483,25 @@ impl FfmpegMediaEngine {
             ffmpeg_bin: ffmpeg_bin.into(),
             ffprobe_bin: ffprobe_bin.into(),
             yt_dlp_bin: yt_dlp_bin.into(),
+            whisper_bin: None,
+            whisper_model: None,
+            executor: Arc::new(ProcessCommandExecutor),
+        }
+    }
+
+    pub fn with_all_bins_and_transcription(
+        ffmpeg_bin: impl Into<String>,
+        ffprobe_bin: impl Into<String>,
+        yt_dlp_bin: impl Into<String>,
+        whisper_bin: Option<String>,
+        whisper_model: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            ffmpeg_bin: ffmpeg_bin.into(),
+            ffprobe_bin: ffprobe_bin.into(),
+            yt_dlp_bin: yt_dlp_bin.into(),
+            whisper_bin,
+            whisper_model,
             executor: Arc::new(ProcessCommandExecutor),
         }
     }
@@ -313,6 +515,8 @@ impl FfmpegMediaEngine {
             ffmpeg_bin: ffmpeg_bin.into(),
             ffprobe_bin: ffprobe_bin.into(),
             yt_dlp_bin: "yt-dlp".to_string(),
+            whisper_bin: None,
+            whisper_model: None,
             executor,
         }
     }
@@ -327,6 +531,26 @@ impl FfmpegMediaEngine {
             ffmpeg_bin: ffmpeg_bin.into(),
             ffprobe_bin: ffprobe_bin.into(),
             yt_dlp_bin: yt_dlp_bin.into(),
+            whisper_bin: None,
+            whisper_model: None,
+            executor,
+        }
+    }
+
+    pub fn with_all_bins_transcription_and_executor(
+        ffmpeg_bin: impl Into<String>,
+        ffprobe_bin: impl Into<String>,
+        yt_dlp_bin: impl Into<String>,
+        whisper_bin: Option<String>,
+        whisper_model: Option<PathBuf>,
+        executor: Arc<dyn CommandExecutor>,
+    ) -> Self {
+        Self {
+            ffmpeg_bin: ffmpeg_bin.into(),
+            ffprobe_bin: ffprobe_bin.into(),
+            yt_dlp_bin: yt_dlp_bin.into(),
+            whisper_bin,
+            whisper_model,
             executor,
         }
     }
@@ -611,6 +835,71 @@ impl TranscriptProvider for FfmpegMediaEngine {
             language,
         })
     }
+
+    fn generate_transcript(
+        &self,
+        request: &TranscriptGenerateRequest,
+    ) -> Result<TranscriptGenerateResult, EngineError> {
+        let media_path = Path::new(&request.media_path);
+        self.validate_source_path(media_path)?;
+        let output_path = Path::new(&request.output_path);
+        self.validate_output_path(media_path, output_path)?;
+        if output_path.extension().and_then(|ext| ext.to_str()) != Some("vtt") {
+            return Err(EngineError::InvalidPath(format!(
+                "expected output_path to end with .vtt, got {}",
+                output_path.display()
+            )));
+        }
+
+        let whisper_bin =
+            self.whisper_bin
+                .as_deref()
+                .ok_or_else(|| EngineError::CommandFailed {
+                    command: "whisper".to_string(),
+                    message: "transcription runtime is not configured".to_string(),
+                })?;
+        let whisper_model =
+            self.whisper_model
+                .as_deref()
+                .ok_or_else(|| EngineError::CommandFailed {
+                    command: whisper_bin.to_string(),
+                    message: "transcription model is not configured".to_string(),
+                })?;
+
+        self.validate_source_path(whisper_model)?;
+
+        let language = request.language.clone().unwrap_or_else(|| "en".to_string());
+        let output_base = request
+            .output_path
+            .strip_suffix(".vtt")
+            .unwrap_or(&request.output_path)
+            .to_string();
+        let args = vec![
+            "-m".to_string(),
+            whisper_model.to_string_lossy().to_string(),
+            "-f".to_string(),
+            request.media_path.clone(),
+            "-l".to_string(),
+            language.clone(),
+            "-ovtt".to_string(),
+            "-of".to_string(),
+            output_base,
+        ];
+        self.run_checked(whisper_bin, &args)?;
+
+        if !output_path.is_file() {
+            return Err(EngineError::OutputInvalid(format!(
+                "transcription completed without creating {}",
+                output_path.display()
+            )));
+        }
+
+        Ok(TranscriptGenerateResult {
+            transcript_path: request.output_path.clone(),
+            format: "vtt".to_string(),
+            language,
+        })
+    }
 }
 
 impl MediaProbe for FfmpegMediaEngine {
@@ -806,6 +1095,519 @@ impl DiagnosticsProvider for FfmpegMediaEngine {
     }
 }
 
+impl RuntimeSetupProvider for FfmpegMediaEngine {
+    fn setup_manifest(&self, context: &SetupContext) -> SetupManifest {
+        SetupManifest {
+            schema_version: 1,
+            platform: context.platform.clone(),
+            setup_modes: vec!["automatic".to_string(), "disabled".to_string()],
+            ai_provider_order: vec![
+                ProviderSource::Ollama,
+                ProviderSource::Tv7Managed,
+                ProviderSource::Tv7Cloud,
+            ],
+            assets: vec![
+                SetupManifestAsset {
+                    id: "whisper-runtime.user-path".to_string(),
+                    kind: RuntimeAssetKind::TranscriptionRuntime,
+                    name: "User-installed Whisper runtime".to_string(),
+                    required_for: vec!["transcription".to_string(), "offline_creation".to_string()],
+                    installable: false,
+                    bundled: false,
+                    source: ProviderSource::UserPath,
+                    version: None,
+                    download: None,
+                },
+                SetupManifestAsset {
+                    id: format!("whisper-model.tv7-managed.{}", context.platform),
+                    kind: RuntimeAssetKind::TranscriptionModel,
+                    name: "TV7-managed Whisper model".to_string(),
+                    required_for: vec!["transcription".to_string(), "offline_creation".to_string()],
+                    installable: true,
+                    bundled: false,
+                    source: ProviderSource::Tv7Managed,
+                    version: None,
+                    download: None,
+                },
+                SetupManifestAsset {
+                    id: "ollama.user-runtime".to_string(),
+                    kind: RuntimeAssetKind::LlmRuntime,
+                    name: "User-installed Ollama runtime".to_string(),
+                    required_for: vec!["ai".to_string(), "offline_creation".to_string()],
+                    installable: false,
+                    bundled: false,
+                    source: ProviderSource::Ollama,
+                    version: None,
+                    download: None,
+                },
+                SetupManifestAsset {
+                    id: "ollama.user-model".to_string(),
+                    kind: RuntimeAssetKind::LlmModel,
+                    name: "User-installed Ollama model".to_string(),
+                    required_for: vec!["ai".to_string(), "offline_creation".to_string()],
+                    installable: false,
+                    bundled: false,
+                    source: ProviderSource::Ollama,
+                    version: context.ollama_model.clone(),
+                    download: None,
+                },
+                SetupManifestAsset {
+                    id: format!("local-llm.tv7-managed.{}", context.platform),
+                    kind: RuntimeAssetKind::LlmModel,
+                    name: "TV7-managed local LLM".to_string(),
+                    required_for: vec!["ai".to_string(), "offline_creation".to_string()],
+                    installable: true,
+                    bundled: false,
+                    source: ProviderSource::Tv7Managed,
+                    version: None,
+                    download: None,
+                },
+            ],
+        }
+    }
+
+    fn setup_status(&self, context: &SetupContext) -> SetupStatus {
+        let whisper_runtime = self.detect_whisper_runtime(context);
+        let whisper_model = detect_path_asset(
+            "whisper-model.user-path",
+            RuntimeAssetKind::TranscriptionModel,
+            "User-provided Whisper model",
+            ProviderSource::UserPath,
+            context.whisper_model.as_deref(),
+        );
+        let ollama_runtime = self.detect_ollama_runtime(context);
+        let ollama_model = self.detect_ollama_model(context, &ollama_runtime);
+
+        let whisper_runtime_ready = whisper_runtime.status == SetupItemStatus::Available;
+        let whisper_model_ready = whisper_model.status == SetupItemStatus::Available;
+        let ollama_runtime_ready = ollama_runtime.status == SetupItemStatus::Available;
+        let ollama_model_ready = ollama_model.status == SetupItemStatus::Available;
+        let transcription_ready = whisper_runtime_ready && whisper_model_ready;
+        let local_ai_ready = ollama_runtime_ready && ollama_model_ready;
+        let ai_ready = local_ai_ready || context.cloud_ai_available;
+        let offline_ready = transcription_ready && local_ai_ready;
+
+        SetupStatus {
+            schema_version: 1,
+            setup_complete: offline_ready,
+            active_ai_provider: active_ai_provider(local_ai_ready, context.cloud_ai_available),
+            assets: vec![
+                whisper_runtime,
+                whisper_model,
+                SetupAssetStatus {
+                    id: format!("whisper-model.tv7-managed.{}", context.platform),
+                    kind: RuntimeAssetKind::TranscriptionModel,
+                    name: "TV7-managed Whisper model".to_string(),
+                    status: SetupItemStatus::Installable,
+                    source: ProviderSource::Tv7Managed,
+                    path: Some(
+                        context
+                            .asset_dir
+                            .join("models")
+                            .join("whisper")
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                    version: None,
+                    error: Some("download requires explicit user confirmation".to_string()),
+                },
+                ollama_runtime,
+                ollama_model,
+                SetupAssetStatus {
+                    id: format!("local-llm.tv7-managed.{}", context.platform),
+                    kind: RuntimeAssetKind::LlmModel,
+                    name: "TV7-managed local LLM".to_string(),
+                    status: SetupItemStatus::Installable,
+                    source: ProviderSource::Tv7Managed,
+                    path: Some(
+                        context
+                            .asset_dir
+                            .join("models")
+                            .join("llm")
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                    version: None,
+                    error: Some("download requires explicit user confirmation".to_string()),
+                },
+            ],
+            ai_providers: ai_provider_candidates(
+                local_ai_ready,
+                context.cloud_ai_available,
+                context.ollama_model.as_deref(),
+                &context.platform,
+            ),
+            capabilities: vec![
+                SetupCapabilityStatus {
+                    name: "transcription".to_string(),
+                    status: setup_status_for(transcription_ready),
+                    provider: if transcription_ready {
+                        Some(ProviderSource::UserPath)
+                    } else {
+                        None
+                    },
+                    missing: missing_for_transcription(whisper_runtime_ready, whisper_model_ready),
+                    installable: true,
+                    user_action_required: !transcription_ready,
+                },
+                SetupCapabilityStatus {
+                    name: "ai".to_string(),
+                    status: setup_status_for(ai_ready),
+                    provider: active_ai_provider(local_ai_ready, context.cloud_ai_available),
+                    missing: missing_for_ai(
+                        ollama_runtime_ready,
+                        ollama_model_ready,
+                        context.ollama_model.as_deref(),
+                        context.cloud_ai_available,
+                    ),
+                    installable: true,
+                    user_action_required: !ai_ready,
+                },
+                SetupCapabilityStatus {
+                    name: "offline_creation".to_string(),
+                    status: setup_status_for(offline_ready),
+                    provider: if offline_ready {
+                        Some(ProviderSource::UserPath)
+                    } else {
+                        None
+                    },
+                    missing: missing_for_offline_creation(transcription_ready, local_ai_ready),
+                    installable: true,
+                    user_action_required: !offline_ready,
+                },
+            ],
+        }
+    }
+}
+
+impl FfmpegMediaEngine {
+    fn detect_whisper_runtime(&self, context: &SetupContext) -> SetupAssetStatus {
+        let candidates = context
+            .whisper_bin
+            .clone()
+            .map(|bin| vec![bin])
+            .unwrap_or_else(|| vec!["whisper-cli".to_string(), "whisper".to_string()]);
+
+        for candidate in candidates {
+            if let Some(version) = self.detect_tool_version(&candidate, &["--help"]) {
+                return SetupAssetStatus {
+                    id: "whisper-runtime.user-path".to_string(),
+                    kind: RuntimeAssetKind::TranscriptionRuntime,
+                    name: "User-installed Whisper runtime".to_string(),
+                    status: SetupItemStatus::Available,
+                    source: ProviderSource::UserPath,
+                    path: Some(candidate),
+                    version,
+                    error: None,
+                };
+            }
+        }
+
+        SetupAssetStatus {
+            id: "whisper-runtime.user-path".to_string(),
+            kind: RuntimeAssetKind::TranscriptionRuntime,
+            name: "User-installed Whisper runtime".to_string(),
+            status: SetupItemStatus::Missing,
+            source: ProviderSource::UserPath,
+            path: context.whisper_bin.clone(),
+            version: None,
+            error: Some("no configured or PATH-resolved Whisper runtime found".to_string()),
+        }
+    }
+
+    fn detect_ollama_runtime(&self, context: &SetupContext) -> SetupAssetStatus {
+        match self.detect_tool_version(&context.ollama_bin, &["--version"]) {
+            Some(version) => SetupAssetStatus {
+                id: "ollama.user-runtime".to_string(),
+                kind: RuntimeAssetKind::LlmRuntime,
+                name: "User-installed Ollama runtime".to_string(),
+                status: SetupItemStatus::Available,
+                source: ProviderSource::Ollama,
+                path: Some(context.ollama_bin.clone()),
+                version,
+                error: None,
+            },
+            None => SetupAssetStatus {
+                id: "ollama.user-runtime".to_string(),
+                kind: RuntimeAssetKind::LlmRuntime,
+                name: "User-installed Ollama runtime".to_string(),
+                status: SetupItemStatus::Missing,
+                source: ProviderSource::Ollama,
+                path: Some(context.ollama_bin.clone()),
+                version: None,
+                error: Some("Ollama is not available on the configured path".to_string()),
+            },
+        }
+    }
+
+    fn detect_ollama_model(
+        &self,
+        context: &SetupContext,
+        runtime: &SetupAssetStatus,
+    ) -> SetupAssetStatus {
+        let Some(model) = context.ollama_model.as_deref() else {
+            return SetupAssetStatus {
+                id: "ollama.user-model".to_string(),
+                kind: RuntimeAssetKind::LlmModel,
+                name: "User-installed Ollama model".to_string(),
+                status: SetupItemStatus::Missing,
+                source: ProviderSource::Ollama,
+                path: None,
+                version: None,
+                error: Some("TV7_ENGINE_OLLAMA_MODEL is not configured".to_string()),
+            };
+        };
+
+        if runtime.status != SetupItemStatus::Available {
+            return SetupAssetStatus {
+                id: "ollama.user-model".to_string(),
+                kind: RuntimeAssetKind::LlmModel,
+                name: "User-installed Ollama model".to_string(),
+                status: SetupItemStatus::Missing,
+                source: ProviderSource::Ollama,
+                path: None,
+                version: Some(model.to_string()),
+                error: Some("Ollama runtime is unavailable".to_string()),
+            };
+        }
+
+        let args = vec!["list".to_string()];
+        match self.executor.run(&context.ollama_bin, &args) {
+            Ok(output) if output.status_success => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let found = stdout.lines().any(|line| {
+                    line.split_whitespace()
+                        .next()
+                        .map(|name| name == model || name.starts_with(&format!("{model}:")))
+                        .unwrap_or(false)
+                });
+                SetupAssetStatus {
+                    id: "ollama.user-model".to_string(),
+                    kind: RuntimeAssetKind::LlmModel,
+                    name: "User-installed Ollama model".to_string(),
+                    status: if found {
+                        SetupItemStatus::Available
+                    } else {
+                        SetupItemStatus::Missing
+                    },
+                    source: ProviderSource::Ollama,
+                    path: None,
+                    version: Some(model.to_string()),
+                    error: if found {
+                        None
+                    } else {
+                        Some("configured Ollama model is not installed".to_string())
+                    },
+                }
+            }
+            Ok(output) => SetupAssetStatus {
+                id: "ollama.user-model".to_string(),
+                kind: RuntimeAssetKind::LlmModel,
+                name: "User-installed Ollama model".to_string(),
+                status: SetupItemStatus::Missing,
+                source: ProviderSource::Ollama,
+                path: None,
+                version: Some(model.to_string()),
+                error: Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+            },
+            Err(error) => SetupAssetStatus {
+                id: "ollama.user-model".to_string(),
+                kind: RuntimeAssetKind::LlmModel,
+                name: "User-installed Ollama model".to_string(),
+                status: SetupItemStatus::Missing,
+                source: ProviderSource::Ollama,
+                path: None,
+                version: Some(model.to_string()),
+                error: Some(error.to_string()),
+            },
+        }
+    }
+
+    fn detect_tool_version(&self, executable: &str, args: &[&str]) -> Option<Option<String>> {
+        let args = args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        match self.executor.run(executable, &args) {
+            Ok(output) if output.status_success => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Some(
+                    stdout
+                        .lines()
+                        .chain(stderr.lines())
+                        .next()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_string),
+                )
+            }
+            _ => None,
+        }
+    }
+}
+
+fn detect_path_asset(
+    id: &str,
+    kind: RuntimeAssetKind,
+    name: &str,
+    source: ProviderSource,
+    path: Option<&Path>,
+) -> SetupAssetStatus {
+    match path {
+        Some(path) if path.is_file() => SetupAssetStatus {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            status: SetupItemStatus::Available,
+            source,
+            path: Some(path.to_string_lossy().to_string()),
+            version: None,
+            error: None,
+        },
+        Some(path) => SetupAssetStatus {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            status: SetupItemStatus::Missing,
+            source,
+            path: Some(path.to_string_lossy().to_string()),
+            version: None,
+            error: Some("configured path does not point to a file".to_string()),
+        },
+        None => SetupAssetStatus {
+            id: id.to_string(),
+            kind,
+            name: name.to_string(),
+            status: SetupItemStatus::Missing,
+            source,
+            path: None,
+            version: None,
+            error: Some("not configured".to_string()),
+        },
+    }
+}
+
+fn setup_status_for(ready: bool) -> SetupCapabilityState {
+    if ready {
+        SetupCapabilityState::Ready
+    } else {
+        SetupCapabilityState::NotReady
+    }
+}
+
+fn missing_for_transcription(runtime_ready: bool, model_ready: bool) -> Vec<String> {
+    let mut missing = Vec::new();
+    if !runtime_ready {
+        missing.push("transcription_runtime".to_string());
+    }
+    if !model_ready {
+        missing.push("transcription_model".to_string());
+    }
+    missing
+}
+
+fn active_ai_provider(local_ai_ready: bool, cloud_ai_available: bool) -> Option<ProviderSource> {
+    if local_ai_ready {
+        Some(ProviderSource::Ollama)
+    } else if cloud_ai_available {
+        Some(ProviderSource::Tv7Cloud)
+    } else {
+        None
+    }
+}
+
+fn ai_provider_candidates(
+    local_ai_ready: bool,
+    cloud_ai_available: bool,
+    ollama_model: Option<&str>,
+    platform: &str,
+) -> Vec<AiProviderCandidate> {
+    vec![
+        AiProviderCandidate {
+            source: ProviderSource::Ollama,
+            status: if local_ai_ready {
+                ProviderCandidateStatus::Ready
+            } else {
+                ProviderCandidateStatus::MissingAssets
+            },
+            required_assets: missing_local_ai_assets(local_ai_ready, ollama_model),
+            requires_internet: false,
+            requires_user_confirmation: !local_ai_ready,
+            cost_policy: "user_local".to_string(),
+            action: if local_ai_ready {
+                None
+            } else {
+                Some("Install Ollama and configure TV7_ENGINE_OLLAMA_MODEL, or use another AI provider.".to_string())
+            },
+        },
+        AiProviderCandidate {
+            source: ProviderSource::Tv7Managed,
+            status: ProviderCandidateStatus::Installable,
+            required_assets: vec![format!("local-llm.tv7-managed.{platform}")],
+            requires_internet: true,
+            requires_user_confirmation: true,
+            cost_policy: "one_time_download".to_string(),
+            action: Some(
+                "Download or import a TV7-managed local model after explicit user confirmation."
+                    .to_string(),
+            ),
+        },
+        AiProviderCandidate {
+            source: ProviderSource::Tv7Cloud,
+            status: if cloud_ai_available {
+                ProviderCandidateStatus::Ready
+            } else {
+                ProviderCandidateStatus::Unavailable
+            },
+            required_assets: Vec::new(),
+            requires_internet: true,
+            requires_user_confirmation: false,
+            cost_policy: "tv7_managed_usage".to_string(),
+            action: if cloud_ai_available {
+                None
+            } else {
+                Some("TV7 cloud AI is unavailable for this account or environment.".to_string())
+            },
+        },
+    ]
+}
+
+fn missing_for_ai(
+    runtime_ready: bool,
+    model_ready: bool,
+    ollama_model: Option<&str>,
+    cloud_ai_available: bool,
+) -> Vec<String> {
+    if cloud_ai_available {
+        return Vec::new();
+    }
+    missing_local_ai_assets(runtime_ready && model_ready, ollama_model)
+}
+
+fn missing_local_ai_assets(local_ai_ready: bool, ollama_model: Option<&str>) -> Vec<String> {
+    if local_ai_ready {
+        return Vec::new();
+    }
+    let mut missing = Vec::new();
+    missing.push("llm_runtime".to_string());
+    if ollama_model.is_none() {
+        missing.push("llm_model".to_string());
+    }
+    missing
+}
+
+fn missing_for_offline_creation(transcription_ready: bool, local_ai_ready: bool) -> Vec<String> {
+    let mut missing = Vec::new();
+    if !transcription_ready {
+        missing.push("transcription".to_string());
+    }
+    if !local_ai_ready {
+        missing.push("local_ai".to_string());
+    }
+    missing
+}
+
 fn list_files(directory: &Path) -> Result<Vec<PathBuf>, EngineError> {
     let mut files = Vec::new();
     for entry in fs::read_dir(directory).map_err(|error| EngineError::Io(error.to_string()))? {
@@ -931,12 +1733,60 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct TranscriptExecutor {
+        calls: Mutex<Vec<(String, Vec<String>)>>,
+    }
+
+    impl TranscriptExecutor {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, Vec<String>)> {
+            self.calls
+                .lock()
+                .expect("mock lock should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl CommandExecutor for TranscriptExecutor {
+        fn run(&self, executable: &str, args: &[String]) -> Result<ToolOutput, EngineError> {
+            self.calls
+                .lock()
+                .expect("mock lock should not be poisoned")
+                .push((executable.to_string(), args.to_vec()));
+            let output_base = args
+                .windows(2)
+                .find(|pair| pair[0] == "-of")
+                .map(|pair| pair[1].clone())
+                .expect("transcript command should include -of");
+            fs::write(format!("{output_base}.vtt"), "WEBVTT\n\n")
+                .map_err(|error| EngineError::Io(error.to_string()))?;
+            Ok(ToolOutput {
+                status_success: true,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
     fn success_output(stdout: &[u8]) -> ToolOutput {
         ToolOutput {
             status_success: true,
             stdout: stdout.to_vec(),
             stderr: Vec::new(),
         }
+    }
+
+    fn failed_command(command: &str) -> Result<ToolOutput, EngineError> {
+        Err(EngineError::CommandFailed {
+            command: command.to_string(),
+            message: "missing".to_string(),
+        })
     }
 
     static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1204,6 +2054,124 @@ mod tests {
     }
 
     #[test]
+    fn setup_status_prefers_user_installed_whisper_and_ollama_assets() {
+        let model_path = unique_temp_file_path("bin");
+        fs::write(&model_path, b"model").expect("model fixture should be created");
+        let executor = Arc::new(MockExecutor::new(vec![
+            Ok(success_output(b"whisper-cli help")),
+            Ok(success_output(b"ollama version 0.1.0")),
+            Ok(success_output(b"NAME ID SIZE\n gemma4:latest abc 4GB\n")),
+        ]));
+        let engine =
+            FfmpegMediaEngine::with_all_bins_and_executor("ffmpeg", "ffprobe", "yt-dlp", executor);
+
+        let status = engine.setup_status(&SetupContext::new(
+            "test-platform",
+            std::env::temp_dir().join("tv7-assets"),
+            Some("whisper-cli".to_string()),
+            Some(model_path.clone()),
+            "ollama",
+            Some("gemma4".to_string()),
+            true,
+        ));
+
+        let transcription = status
+            .capabilities
+            .iter()
+            .find(|capability| capability.name == "transcription")
+            .expect("transcription capability should exist");
+        assert_eq!(transcription.status, SetupCapabilityState::Ready);
+        assert_eq!(transcription.provider, Some(ProviderSource::UserPath));
+
+        let ai = status
+            .capabilities
+            .iter()
+            .find(|capability| capability.name == "ai")
+            .expect("ai capability should exist");
+        assert_eq!(ai.status, SetupCapabilityState::Ready);
+        assert_eq!(ai.provider, Some(ProviderSource::Ollama));
+        assert_eq!(status.active_ai_provider, Some(ProviderSource::Ollama));
+
+        fs::remove_file(model_path).expect("model fixture should be removed");
+    }
+
+    #[test]
+    fn setup_status_uses_tv7_cloud_ai_without_marking_offline_creation_ready() {
+        let executor = Arc::new(MockExecutor::new(vec![
+            failed_command("whisper-cli"),
+            failed_command("whisper"),
+            failed_command("ollama"),
+        ]));
+        let engine =
+            FfmpegMediaEngine::with_all_bins_and_executor("ffmpeg", "ffprobe", "yt-dlp", executor);
+
+        let status = engine.setup_status(&SetupContext::new(
+            "test-platform",
+            std::env::temp_dir().join("tv7-assets"),
+            None,
+            None,
+            "ollama",
+            None,
+            true,
+        ));
+
+        let ai = status
+            .capabilities
+            .iter()
+            .find(|capability| capability.name == "ai")
+            .expect("ai capability should exist");
+        assert_eq!(ai.status, SetupCapabilityState::Ready);
+        assert_eq!(ai.provider, Some(ProviderSource::Tv7Cloud));
+
+        let offline = status
+            .capabilities
+            .iter()
+            .find(|capability| capability.name == "offline_creation")
+            .expect("offline_creation capability should exist");
+        assert_eq!(offline.status, SetupCapabilityState::NotReady);
+        assert!(offline.missing.contains(&"transcription".to_string()));
+        assert!(offline.missing.contains(&"local_ai".to_string()));
+    }
+
+    #[test]
+    fn setup_status_reports_installable_fallbacks_without_downloads() {
+        let executor = Arc::new(MockExecutor::new(vec![
+            failed_command("whisper-cli"),
+            failed_command("whisper"),
+            failed_command("ollama"),
+        ]));
+        let engine =
+            FfmpegMediaEngine::with_all_bins_and_executor("ffmpeg", "ffprobe", "yt-dlp", executor);
+
+        let status = engine.setup_status(&SetupContext::new(
+            "test-platform",
+            std::env::temp_dir().join("tv7-assets"),
+            None,
+            None,
+            "ollama",
+            None,
+            false,
+        ));
+
+        let installable_assets = status
+            .assets
+            .iter()
+            .filter(|asset| asset.status == SetupItemStatus::Installable)
+            .map(|asset| asset.source.clone())
+            .collect::<Vec<_>>();
+        assert!(installable_assets.contains(&ProviderSource::Tv7Managed));
+
+        let offline = status
+            .capabilities
+            .iter()
+            .find(|capability| capability.name == "offline_creation")
+            .expect("offline_creation capability should exist");
+        assert_eq!(offline.status, SetupCapabilityState::NotReady);
+        assert!(offline.user_action_required);
+        assert!(offline.installable);
+    }
+
+    #[test]
     fn rejects_non_http_and_local_ingest_urls() {
         let engine = FfmpegMediaEngine::new();
         let output_dir = std::env::temp_dir().to_string_lossy().to_string();
@@ -1234,6 +2202,55 @@ mod tests {
         let path = "/tmp/video.vtt.vtt".to_string();
         let output_base = path.strip_suffix(".vtt").unwrap_or(&path).to_string();
         assert_eq!(output_base, "/tmp/video.vtt");
+    }
+
+    #[test]
+    fn generate_transcript_runs_configured_whisper_and_returns_vtt_path() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "tv7-engine-transcript-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should be created");
+        let media_path = temp_root.join("video.mp4");
+        let model_path = temp_root.join("ggml-base.bin");
+        let output_path = temp_root.join("video.vtt");
+        fs::write(&media_path, b"fake video").expect("media file should be created");
+        fs::write(&model_path, b"fake model").expect("model file should be created");
+        let executor = Arc::new(TranscriptExecutor::new());
+        let engine = FfmpegMediaEngine::with_all_bins_transcription_and_executor(
+            "ffmpeg",
+            "ffprobe",
+            "yt-dlp",
+            Some("whisper-cli".to_string()),
+            Some(model_path.clone()),
+            executor.clone(),
+        );
+
+        let result = engine
+            .generate_transcript(&TranscriptGenerateRequest {
+                media_path: media_path.to_string_lossy().to_string(),
+                output_path: output_path.to_string_lossy().to_string(),
+                language: Some("en".to_string()),
+            })
+            .expect("transcript generation should succeed");
+
+        assert_eq!(result.transcript_path, output_path.to_string_lossy());
+        assert_eq!(result.format, "vtt");
+        assert_eq!(result.language, "en");
+        let calls = executor.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "whisper-cli");
+        assert!(calls[0].1.contains(&"-ovtt".to_string()));
+        assert!(
+            calls[0]
+                .1
+                .contains(&model_path.to_string_lossy().to_string())
+        );
+        fs::remove_dir_all(temp_root).expect("temp root should be removed");
     }
 
     #[test]
