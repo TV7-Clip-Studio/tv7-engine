@@ -11,11 +11,24 @@ Local-first engine that powers media and AI workloads for the TV7 app. The codeb
 - Initial local HTTP surface is implemented in `engine-service`:
   - `GET /health`
   - `GET /v1/diagnostics`
+  - `GET /v1/setup/manifest`
+  - `GET /v1/setup/status`
+  - `POST /v1/ai/cloud-token`
+  - `DELETE /v1/ai/cloud-token`
+  - `POST /v1/ai/cloud-debug`
+  - `POST /v1/ai/transcript-intelligence`
   - `POST /v1/media/probe`
   - `POST /v1/media/thumbnail`
   - `POST /v1/media/render-clip`
-- Engine computes locally only; no business logic or cloud calls belong here.
+  - `POST /v1/ingest/url`
+  - `POST /v1/transcripts/download`
+  - `POST /v1/transcripts/generate`
+  - `GET /v1/jobs/:id`
+  - `GET /v1/jobs/:id/logs`
+  - `POST /v1/jobs/:id/cancel`
+- Engine owns local compute and AI dispatch. TV7 cloud AI calls go through Backend using a short-lived delegated Engine token; business logic and provider credentials stay out of Engine.
 - Loopback-only surface; inputs must use absolute paths.
+- Local transcript generation requires explicit `TV7_ENGINE_WHISPER_BIN` and `TV7_ENGINE_WHISPER_MODEL` setup; Engine reports `TRANSCRIPTION_SETUP_REQUIRED` instead of downloading models silently.
 - Studio migration details live in `docs/core/contracts/tv7-engine/studio-sidecar-migration.md`.
 
 ## Run Locally
@@ -28,9 +41,16 @@ Environment variables:
 - `TV7_ENGINE_PORT` (default: `7070`)
 - `TV7_ENGINE_LOG_LEVEL` (default: `debug` via `make dev`)
 - `TV7_ENGINE_WORK_DIR` (default: current working directory, must be absolute existing directory)
+- `TV7_ENGINE_ASSET_DIR` (default: `$TV7_ENGINE_WORK_DIR/.tv7-engine-assets`, must be absolute when set)
 - `TV7_ENGINE_FFMPEG_BIN` (default: `ffmpeg`)
 - `TV7_ENGINE_FFPROBE_BIN` (default: `ffprobe`)
 - `TV7_ENGINE_YT_DLP_BIN` (default: `yt-dlp`)
+- `TV7_ENGINE_WHISPER_BIN` (optional user-installed Whisper-compatible runtime path/name)
+- `TV7_ENGINE_WHISPER_MODEL` (optional absolute path to a user-provided Whisper model)
+- `TV7_ENGINE_OLLAMA_BIN` (default: `ollama`)
+- `TV7_ENGINE_OLLAMA_MODEL` (optional user-installed Ollama model name)
+- `TV7_ENGINE_CLOUD_AI_AVAILABLE` (default: `true`; set `false` when TV7 cloud AI is unavailable in the current environment)
+- `TV7_ENGINE_BACKEND_BASE_URL` (optional Backend base URL for TV7 cloud AI execution)
 
 Useful commands:
 - `make check` - compile workspace checks.

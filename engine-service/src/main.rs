@@ -6,20 +6,23 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use engine_core::{
     ClipRenderer, DiagnosticStatus, DiagnosticsContext, DiagnosticsProvider, EngineDiagnostics,
-    EngineError, FfmpegMediaEngine, MediaMetadata, MediaProbe, RenderClipRequest, RenderClipResult,
-    ThumbnailGenerator, ThumbnailRequest, ThumbnailResult, TranscriptDownloadRequest,
-    TranscriptProvider, UrlIngestRequest, UrlIngestor,
+    EngineError, FfmpegMediaEngine, MediaMetadata, MediaProbe, ProviderSource, RenderClipRequest,
+    RenderClipResult, RuntimeSetupProvider, SetupCapabilityState, SetupContext, SetupManifest,
+    SetupStatus, ThumbnailGenerator, ThumbnailRequest, ThumbnailResult, TranscriptDownloadRequest,
+    TranscriptGenerateRequest, TranscriptProvider, UrlIngestRequest, UrlIngestor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -27,8 +30,12 @@ type SharedMediaProbe = Arc<dyn MediaProbe>;
 type SharedThumbnailGenerator = Arc<dyn ThumbnailGenerator>;
 type SharedClipRenderer = Arc<dyn ClipRenderer>;
 type SharedDiagnosticsProvider = Arc<dyn DiagnosticsProvider>;
+type SharedRuntimeSetupProvider = Arc<dyn RuntimeSetupProvider>;
 type SharedUrlIngestor = Arc<dyn UrlIngestor>;
 type SharedTranscriptProvider = Arc<dyn TranscriptProvider>;
+type SharedCloudAiExecutor = Arc<dyn CloudAiExecutor>;
+type CloudAiExecuteFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<CloudAiExecuteResponse, CloudAiError>> + Send + 'a>>;
 
 #[derive(Clone)]
 struct AppState {
@@ -36,10 +43,23 @@ struct AppState {
     thumbnail_generator: SharedThumbnailGenerator,
     clip_renderer: SharedClipRenderer,
     diagnostics_provider: SharedDiagnosticsProvider,
+    setup_provider: SharedRuntimeSetupProvider,
     url_ingestor: SharedUrlIngestor,
     transcript_provider: SharedTranscriptProvider,
     jobs: JobStore,
     diagnostics_context: DiagnosticsContext,
+    setup_context: SetupContext,
+    cloud_ai_tokens: CloudAiTokenStore,
+    cloud_ai_executor: SharedCloudAiExecutor,
+}
+
+impl AppState {
+    fn effective_setup_context(&self) -> SetupContext {
+        let mut context = self.setup_context.clone();
+        context.cloud_ai_available =
+            self.setup_context.cloud_ai_available && self.cloud_ai_tokens.has_ready_token();
+        context
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -48,45 +68,65 @@ struct AppConfig {
     port: u16,
     log_level: String,
     work_dir: PathBuf,
+    asset_dir: PathBuf,
     ffmpeg_bin: String,
     ffprobe_bin: String,
     yt_dlp_bin: String,
+    whisper_bin: Option<String>,
+    whisper_model: Option<PathBuf>,
+    ollama_bin: String,
+    ollama_model: Option<String>,
+    cloud_ai_available: bool,
+    backend_base_url: Option<String>,
+}
+
+#[derive(Debug)]
+struct AppConfigValues {
+    host: Option<String>,
+    port: Option<String>,
+    log_level: Option<String>,
+    work_dir: PathBuf,
+    asset_dir: Option<PathBuf>,
+    ffmpeg_bin: Option<String>,
+    ffprobe_bin: Option<String>,
+    yt_dlp_bin: Option<String>,
+    whisper_bin: Option<String>,
+    whisper_model: Option<PathBuf>,
+    ollama_bin: Option<String>,
+    ollama_model: Option<String>,
+    cloud_ai_available: Option<String>,
+    backend_base_url: Option<String>,
 }
 
 impl AppConfig {
     fn from_env() -> Result<Self> {
-        let host = env::var("TV7_ENGINE_HOST").ok();
-        let port = env::var("TV7_ENGINE_PORT").ok();
-        let log_level = env::var("TV7_ENGINE_LOG_LEVEL").ok();
-        let ffmpeg_bin = env::var("TV7_ENGINE_FFMPEG_BIN").ok();
-        let ffprobe_bin = env::var("TV7_ENGINE_FFPROBE_BIN").ok();
-        let yt_dlp_bin = env::var("TV7_ENGINE_YT_DLP_BIN").ok();
         let work_dir = match env::var("TV7_ENGINE_WORK_DIR") {
             Ok(value) => PathBuf::from(value),
             Err(_) => env::current_dir().context("failed to resolve current directory")?,
         };
 
-        Self::from_values(
-            host.as_deref(),
-            port.as_deref(),
-            log_level.as_deref(),
+        Self::from_values(AppConfigValues {
+            host: env::var("TV7_ENGINE_HOST").ok(),
+            port: env::var("TV7_ENGINE_PORT").ok(),
+            log_level: env::var("TV7_ENGINE_LOG_LEVEL").ok(),
             work_dir,
-            ffmpeg_bin.as_deref(),
-            ffprobe_bin.as_deref(),
-            yt_dlp_bin.as_deref(),
-        )
+            asset_dir: env::var("TV7_ENGINE_ASSET_DIR").ok().map(PathBuf::from),
+            ffmpeg_bin: env::var("TV7_ENGINE_FFMPEG_BIN").ok(),
+            ffprobe_bin: env::var("TV7_ENGINE_FFPROBE_BIN").ok(),
+            yt_dlp_bin: env::var("TV7_ENGINE_YT_DLP_BIN").ok(),
+            whisper_bin: env::var("TV7_ENGINE_WHISPER_BIN").ok(),
+            whisper_model: env::var("TV7_ENGINE_WHISPER_MODEL").ok().map(PathBuf::from),
+            ollama_bin: env::var("TV7_ENGINE_OLLAMA_BIN").ok(),
+            ollama_model: env::var("TV7_ENGINE_OLLAMA_MODEL").ok(),
+            cloud_ai_available: env::var("TV7_ENGINE_CLOUD_AI_AVAILABLE").ok(),
+            backend_base_url: env::var("TV7_ENGINE_BACKEND_BASE_URL").ok(),
+        })
     }
 
-    fn from_values(
-        host: Option<&str>,
-        port: Option<&str>,
-        log_level: Option<&str>,
-        work_dir: PathBuf,
-        ffmpeg_bin: Option<&str>,
-        ffprobe_bin: Option<&str>,
-        yt_dlp_bin: Option<&str>,
-    ) -> Result<Self> {
-        let host = host
+    fn from_values(values: AppConfigValues) -> Result<Self> {
+        let host = values
+            .host
+            .as_deref()
             .map(str::parse::<IpAddr>)
             .transpose()
             .context("TV7_ENGINE_HOST must be a valid ip address")?
@@ -96,39 +136,79 @@ impl AppConfig {
             anyhow::bail!("TV7_ENGINE_HOST must be loopback, got {host}");
         }
 
-        let port = port
+        let port = values
+            .port
+            .as_deref()
             .map(str::parse::<u16>)
             .transpose()
             .context("TV7_ENGINE_PORT must be a valid u16 port")?
             .unwrap_or(7070);
 
-        let log_level = log_level.unwrap_or("info").to_string();
-        let ffmpeg_bin = ffmpeg_bin.unwrap_or("ffmpeg").to_string();
-        let ffprobe_bin = ffprobe_bin.unwrap_or("ffprobe").to_string();
-        let yt_dlp_bin = yt_dlp_bin.unwrap_or("yt-dlp").to_string();
+        let log_level = values.log_level.unwrap_or_else(|| "info".to_string());
+        let ffmpeg_bin = values.ffmpeg_bin.unwrap_or_else(|| "ffmpeg".to_string());
+        let ffprobe_bin = values.ffprobe_bin.unwrap_or_else(|| "ffprobe".to_string());
+        let yt_dlp_bin = values.yt_dlp_bin.unwrap_or_else(|| "yt-dlp".to_string());
+        let ollama_bin = values.ollama_bin.unwrap_or_else(|| "ollama".to_string());
+        let cloud_ai_available = values
+            .cloud_ai_available
+            .as_deref()
+            .map(parse_bool)
+            .transpose()
+            .context("TV7_ENGINE_CLOUD_AI_AVAILABLE must be true or false")?
+            .unwrap_or(true);
+        let backend_base_url = values
+            .backend_base_url
+            .map(|value| value.trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty());
+        let asset_dir = values
+            .asset_dir
+            .unwrap_or_else(|| values.work_dir.join(".tv7-engine-assets"));
 
-        if !work_dir.is_absolute() {
+        if !values.work_dir.is_absolute() {
             anyhow::bail!(
                 "TV7_ENGINE_WORK_DIR must be an absolute path, got {}",
-                work_dir.display()
+                values.work_dir.display()
             );
         }
 
-        if !work_dir.is_dir() {
+        if !values.work_dir.is_dir() {
             anyhow::bail!(
                 "TV7_ENGINE_WORK_DIR must point to an existing directory, got {}",
-                work_dir.display()
+                values.work_dir.display()
             );
+        }
+
+        if !asset_dir.is_absolute() {
+            anyhow::bail!(
+                "TV7_ENGINE_ASSET_DIR must be an absolute path, got {}",
+                asset_dir.display()
+            );
+        }
+
+        if let Some(path) = values.whisper_model.as_deref() {
+            if !path.is_absolute() {
+                anyhow::bail!(
+                    "TV7_ENGINE_WHISPER_MODEL must be an absolute path, got {}",
+                    path.display()
+                );
+            }
         }
 
         Ok(Self {
             host,
             port,
             log_level,
-            work_dir,
+            work_dir: values.work_dir,
+            asset_dir,
             ffmpeg_bin,
             ffprobe_bin,
             yt_dlp_bin,
+            whisper_bin: values.whisper_bin,
+            whisper_model: values.whisper_model,
+            ollama_bin,
+            ollama_model: values.ollama_model,
+            cloud_ai_available,
+            backend_base_url,
         })
     }
 
@@ -173,6 +253,582 @@ struct JobLogsResponse {
     logs: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct SetupRequiredBody {
+    error: &'static str,
+    message: String,
+    missing: Vec<String>,
+    setup_capability: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudAiTokenRequest {
+    token: String,
+    #[serde(default = "default_bearer_token_type")]
+    token_type: String,
+    #[serde(default = "default_cloud_ai_scope")]
+    scope: String,
+    expires_in_seconds: u64,
+    credits_remaining: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct CloudAiTokenStatusResponse {
+    status: CloudAiTokenStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct CloudAiDebugResponse {
+    provider: &'static str,
+    status: CloudAiDebugState,
+    error: Option<String>,
+    token: CloudAiTokenStatus,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TranscriptIntelligenceRequest {
+    transcript: Vec<TranscriptCue>,
+    clip_duration: ClipDurationPreset,
+    timeline_target: TimelineTarget,
+    existing_clips: Option<Vec<ExistingClip>>,
+    max_suggestions: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct TranscriptCue {
+    start_seconds: f64,
+    end_seconds: f64,
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct ExistingClip {
+    start_seconds: f64,
+    end_seconds: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ClipDurationPreset {
+    Short,
+    Medium,
+    Long,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TimelineTarget {
+    UnclippedGapsOnly,
+    EntireVideo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct TranscriptIntelligenceResponse {
+    provider: ProviderExecutionSource,
+    model: String,
+    clips: Vec<AiClipSuggestion>,
+    usage: Option<CloudAiUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct AiClipSuggestion {
+    title: String,
+    start_seconds: f64,
+    end_seconds: f64,
+    reason: String,
+    score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProviderExecutionSource {
+    Ollama,
+    Tv7Managed,
+    Tv7Cloud,
+}
+
+#[derive(Debug, Deserialize)]
+struct AiClipSuggestionEnvelope {
+    clips: Vec<AiClipSuggestion>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CloudAiDebugState {
+    Ready,
+    NotReady,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CloudAiTokenState {
+    Configured,
+    Missing,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct CloudAiTokenStatus {
+    state: CloudAiTokenState,
+    scope: Option<String>,
+    token_type: Option<String>,
+    expires_in_seconds: Option<u64>,
+    credits_remaining: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct CloudAiToken {
+    token: String,
+    token_type: String,
+    scope: String,
+    expires_at: Instant,
+    credits_remaining: Option<i64>,
+}
+
+#[derive(Clone, Default)]
+struct CloudAiTokenStore {
+    token: Arc<Mutex<Option<CloudAiToken>>>,
+}
+
+impl CloudAiTokenStore {
+    fn set(&self, request: CloudAiTokenRequest) -> Result<CloudAiTokenStatus, ApiError> {
+        if request.token.trim().is_empty() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "AI_AUTH_REQUIRED",
+                "cloud AI delegation token is required",
+            ));
+        }
+        if request.token_type != "bearer" {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "AI_AUTH_REQUIRED",
+                "cloud AI delegation token_type must be bearer",
+            ));
+        }
+        if request.scope != "engine:cloud_ai" {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "AI_AUTH_REQUIRED",
+                "cloud AI delegation token scope must be engine:cloud_ai",
+            ));
+        }
+        if request.expires_in_seconds == 0 {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "AI_AUTH_REQUIRED",
+                "cloud AI delegation token must have a positive expiry",
+            ));
+        }
+
+        let token = CloudAiToken {
+            token: request.token,
+            token_type: request.token_type,
+            scope: request.scope,
+            expires_at: Instant::now() + Duration::from_secs(request.expires_in_seconds),
+            credits_remaining: request.credits_remaining,
+        };
+        let status = token.status();
+        *self
+            .token
+            .lock()
+            .expect("cloud token mutex should not be poisoned") = Some(token);
+        Ok(status)
+    }
+
+    fn clear(&self) -> CloudAiTokenStatus {
+        *self
+            .token
+            .lock()
+            .expect("cloud token mutex should not be poisoned") = None;
+        CloudAiTokenStatus::missing()
+    }
+
+    fn status(&self) -> CloudAiTokenStatus {
+        let token = self
+            .token
+            .lock()
+            .expect("cloud token mutex should not be poisoned")
+            .clone();
+        match token {
+            Some(token) => token.status(),
+            None => CloudAiTokenStatus::missing(),
+        }
+    }
+
+    fn bearer_token(&self) -> Option<String> {
+        let token = self
+            .token
+            .lock()
+            .expect("cloud token mutex should not be poisoned")
+            .clone()?;
+        if token.is_expired() {
+            None
+        } else {
+            Some(token.token)
+        }
+    }
+
+    fn has_ready_token(&self) -> bool {
+        self.bearer_token().is_some()
+    }
+}
+
+impl CloudAiToken {
+    fn is_expired(&self) -> bool {
+        Instant::now() >= self.expires_at
+    }
+
+    fn status(&self) -> CloudAiTokenStatus {
+        let now = Instant::now();
+        CloudAiTokenStatus {
+            state: if now >= self.expires_at {
+                CloudAiTokenState::Expired
+            } else {
+                CloudAiTokenState::Configured
+            },
+            scope: Some(self.scope.clone()),
+            token_type: Some(self.token_type.clone()),
+            expires_in_seconds: Some(
+                self.expires_at
+                    .checked_duration_since(now)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ),
+            credits_remaining: self.credits_remaining,
+        }
+    }
+}
+
+impl CloudAiTokenStatus {
+    fn missing() -> Self {
+        Self {
+            state: CloudAiTokenState::Missing,
+            scope: None,
+            token_type: None,
+            expires_in_seconds: None,
+            credits_remaining: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct CloudAiMessage {
+    role: CloudAiMessageRole,
+    content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CloudAiMessageRole {
+    System,
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct CloudAiExecuteRequest {
+    messages: Vec<CloudAiMessage>,
+    model: Option<String>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct CloudAiExecuteResponse {
+    provider: String,
+    model: String,
+    content: String,
+    usage: CloudAiUsage,
+    raw_finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CloudAiUsage {
+    credits_charged: i64,
+    credits_remaining: i64,
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
+    total_tokens: Option<i64>,
+    latency_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CloudAiErrorCode {
+    AuthRequired,
+    LicenseRequired,
+    QuotaExceeded,
+    ProviderUnavailable,
+    NetworkUnavailable,
+    ContextTooLarge,
+}
+
+impl CloudAiErrorCode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::AuthRequired => "AI_AUTH_REQUIRED",
+            Self::LicenseRequired => "AI_LICENSE_REQUIRED",
+            Self::QuotaExceeded => "AI_QUOTA_EXCEEDED",
+            Self::ProviderUnavailable => "AI_PROVIDER_UNAVAILABLE",
+            Self::NetworkUnavailable => "AI_NETWORK_UNAVAILABLE",
+            Self::ContextTooLarge => "AI_CONTEXT_TOO_LARGE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloudAiError {
+    code: CloudAiErrorCode,
+    message: String,
+}
+
+trait CloudAiExecutor: Send + Sync {
+    fn execute<'a>(
+        &'a self,
+        token: &'a str,
+        request: &'a CloudAiExecuteRequest,
+    ) -> CloudAiExecuteFuture<'a>;
+}
+
+#[derive(Clone)]
+struct BackendCloudAiClient {
+    base_url: Option<String>,
+    client: reqwest::Client,
+}
+
+impl BackendCloudAiClient {
+    fn new(base_url: Option<String>) -> Self {
+        Self {
+            base_url,
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl CloudAiExecutor for BackendCloudAiClient {
+    fn execute<'a>(
+        &'a self,
+        token: &'a str,
+        request: &'a CloudAiExecuteRequest,
+    ) -> CloudAiExecuteFuture<'a> {
+        Box::pin(async move {
+            let Some(base_url) = self.base_url.as_deref() else {
+                return Err(CloudAiError {
+                    code: CloudAiErrorCode::NetworkUnavailable,
+                    message: "Backend base URL is not configured".to_string(),
+                });
+            };
+            let url = format!("{base_url}/api/v1/cloud-ai/engine/execute");
+            let response = self
+                .client
+                .post(url)
+                .bearer_auth(token)
+                .json(request)
+                .send()
+                .await
+                .map_err(|error| CloudAiError {
+                    code: CloudAiErrorCode::NetworkUnavailable,
+                    message: error.to_string(),
+                })?;
+            let status = response.status();
+            if status.is_success() {
+                return response.json().await.map_err(|error| CloudAiError {
+                    code: CloudAiErrorCode::ProviderUnavailable,
+                    message: error.to_string(),
+                });
+            }
+
+            Err(map_backend_cloud_ai_error(status, response).await)
+        })
+    }
+}
+
+async fn map_backend_cloud_ai_error(
+    status: reqwest::StatusCode,
+    response: reqwest::Response,
+) -> CloudAiError {
+    let backend_code = response
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|body| {
+            body.get("code")
+                .or_else(|| body.get("error"))
+                .or_else(|| body.pointer("/detail/code"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    let code = backend_code
+        .as_deref()
+        .map(normalize_backend_ai_error_code)
+        .unwrap_or_else(|| match status.as_u16() {
+            401 => CloudAiErrorCode::AuthRequired,
+            402 | 429 => CloudAiErrorCode::QuotaExceeded,
+            403 => CloudAiErrorCode::LicenseRequired,
+            413 | 422 => CloudAiErrorCode::ContextTooLarge,
+            502..=504 => CloudAiErrorCode::ProviderUnavailable,
+            _ => CloudAiErrorCode::ProviderUnavailable,
+        });
+    CloudAiError {
+        code,
+        message: backend_code
+            .unwrap_or_else(|| format!("Backend cloud AI request failed with HTTP {status}")),
+    }
+}
+
+fn normalize_backend_ai_error_code(code: &str) -> CloudAiErrorCode {
+    match code {
+        "AI_AUTH_REQUIRED" => CloudAiErrorCode::AuthRequired,
+        "AI_LICENSE_REQUIRED" => CloudAiErrorCode::LicenseRequired,
+        "AI_QUOTA_EXCEEDED" => CloudAiErrorCode::QuotaExceeded,
+        "AI_NETWORK_UNAVAILABLE" => CloudAiErrorCode::NetworkUnavailable,
+        "AI_CONTEXT_TOO_LARGE" => CloudAiErrorCode::ContextTooLarge,
+        "AI_PROVIDER_UNAVAILABLE" => CloudAiErrorCode::ProviderUnavailable,
+        _ => CloudAiErrorCode::ProviderUnavailable,
+    }
+}
+
+fn validate_transcript_intelligence_request(
+    request: &TranscriptIntelligenceRequest,
+) -> Result<(), ApiError> {
+    if request.transcript.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_TRANSCRIPT",
+            "transcript must contain at least one cue",
+        ));
+    }
+    for cue in &request.transcript {
+        if cue.text.trim().is_empty() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_TRANSCRIPT",
+                "transcript cue text must not be empty",
+            ));
+        }
+        if cue.start_seconds < 0.0 || cue.end_seconds <= cue.start_seconds {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_TRANSCRIPT",
+                "transcript cue times must be non-negative and increasing",
+            ));
+        }
+    }
+    if matches!(request.max_suggestions, Some(0)) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_AI_OPTIONS",
+            "max_suggestions must be positive",
+        ));
+    }
+    Ok(())
+}
+
+async fn execute_cloud_transcript_intelligence(
+    state: &AppState,
+    request: &TranscriptIntelligenceRequest,
+) -> Result<TranscriptIntelligenceResponse, CloudAiError> {
+    let token = state
+        .cloud_ai_tokens
+        .bearer_token()
+        .ok_or_else(|| CloudAiError {
+            code: CloudAiErrorCode::AuthRequired,
+            message: "missing delegated cloud AI token".to_string(),
+        })?;
+    let cloud_request = CloudAiExecuteRequest {
+        messages: build_transcript_intelligence_messages(request),
+        model: None,
+        temperature: Some(0.2),
+        max_tokens: Some(1400),
+    };
+    let cloud_response = state
+        .cloud_ai_executor
+        .execute(&token, &cloud_request)
+        .await?;
+    let envelope: AiClipSuggestionEnvelope = serde_json::from_str(&cloud_response.content)
+        .map_err(|error| CloudAiError {
+            code: CloudAiErrorCode::ProviderUnavailable,
+            message: format!("cloud AI returned invalid transcript intelligence JSON: {error}"),
+        })?;
+    validate_ai_clip_suggestions(&envelope.clips)?;
+    Ok(TranscriptIntelligenceResponse {
+        provider: ProviderExecutionSource::Tv7Cloud,
+        model: cloud_response.model,
+        clips: envelope.clips,
+        usage: Some(cloud_response.usage),
+    })
+}
+
+fn build_transcript_intelligence_messages(
+    request: &TranscriptIntelligenceRequest,
+) -> Vec<CloudAiMessage> {
+    let max_suggestions = request.max_suggestions.unwrap_or(6).min(12);
+    let cue_text = request
+        .transcript
+        .iter()
+        .take(500)
+        .map(|cue| {
+            format!(
+                "[{:.2}-{:.2}] {}",
+                cue.start_seconds,
+                cue.end_seconds,
+                cue.text.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let existing_clips = request
+        .existing_clips
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|clip| format!("[{:.2}-{:.2}]", clip.start_seconds, clip.end_seconds))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    vec![
+        CloudAiMessage {
+            role: CloudAiMessageRole::System,
+            content: "You are TV7 Engine. Return only valid JSON with a top-level clips array. Each clip must include title, start_seconds, end_seconds, reason, and score from 0 to 1. Do not include markdown.".to_string(),
+        },
+        CloudAiMessage {
+            role: CloudAiMessageRole::User,
+            content: format!(
+                "Find up to {max_suggestions} highlight clips for social video creation.\nDuration preset: {:?}\nTimeline target: {:?}\nExisting clips: {}\nTranscript cues:\n{}",
+                request.clip_duration,
+                request.timeline_target,
+                if existing_clips.is_empty() { "none".to_string() } else { existing_clips },
+                cue_text
+            ),
+        },
+    ]
+}
+
+fn validate_ai_clip_suggestions(clips: &[AiClipSuggestion]) -> Result<(), CloudAiError> {
+    for clip in clips {
+        if clip.title.trim().is_empty()
+            || clip.reason.trim().is_empty()
+            || clip.start_seconds < 0.0
+            || clip.end_seconds <= clip.start_seconds
+            || !(0.0..=1.0).contains(&clip.score)
+        {
+            return Err(CloudAiError {
+                code: CloudAiErrorCode::ProviderUnavailable,
+                message: "cloud AI returned invalid clip suggestion fields".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn default_bearer_token_type() -> String {
+    "bearer".to_string()
+}
+
+fn default_cloud_ai_scope() -> String {
+    "engine:cloud_ai".to_string()
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct EngineJob {
     id: String,
@@ -192,6 +848,7 @@ struct EngineJob {
 enum JobKind {
     UrlIngest,
     TranscriptDownload,
+    TranscriptGenerate,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -361,6 +1018,20 @@ struct ErrorBody {
     message: String,
 }
 
+impl From<CloudAiError> for ApiError {
+    fn from(value: CloudAiError) -> Self {
+        let status = match value.code {
+            CloudAiErrorCode::AuthRequired => StatusCode::UNAUTHORIZED,
+            CloudAiErrorCode::LicenseRequired => StatusCode::FORBIDDEN,
+            CloudAiErrorCode::QuotaExceeded => StatusCode::PAYMENT_REQUIRED,
+            CloudAiErrorCode::ProviderUnavailable => StatusCode::BAD_GATEWAY,
+            CloudAiErrorCode::NetworkUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            CloudAiErrorCode::ContextTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        };
+        Self::new(status, value.code.as_str(), value.message)
+    }
+}
+
 impl From<EngineError> for ApiError {
     fn from(value: EngineError) -> Self {
         match value {
@@ -427,15 +1098,155 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/diagnostics", get(diagnostics))
+        .route("/v1/setup/manifest", get(setup_manifest))
+        .route("/v1/setup/status", get(setup_status))
+        .route(
+            "/v1/ai/cloud-token",
+            post(set_cloud_ai_token).delete(clear_cloud_ai_token),
+        )
+        .route("/v1/ai/cloud-debug", post(debug_cloud_ai))
+        .route(
+            "/v1/ai/transcript-intelligence",
+            post(transcript_intelligence),
+        )
         .route("/v1/media/probe", post(probe_media))
         .route("/v1/media/thumbnail", post(generate_thumbnail))
         .route("/v1/media/render-clip", post(render_clip))
         .route("/v1/ingest/url", post(start_url_ingest))
         .route("/v1/transcripts/download", post(start_transcript_download))
+        .route("/v1/transcripts/generate", post(start_transcript_generate))
         .route("/v1/jobs/:id", get(get_job))
         .route("/v1/jobs/:id/logs", get(get_job_logs))
         .route("/v1/jobs/:id/cancel", post(cancel_job))
         .with_state(state)
+}
+
+async fn setup_manifest(State(state): State<AppState>) -> Json<SetupManifest> {
+    debug!("setup manifest endpoint called");
+    Json(state.setup_provider.setup_manifest(&state.setup_context))
+}
+
+async fn setup_status(State(state): State<AppState>) -> Result<Json<SetupStatus>, ApiError> {
+    debug!("setup status endpoint called");
+    Ok(Json(resolve_setup_status(&state).await?))
+}
+
+async fn resolve_setup_status(state: &AppState) -> Result<SetupStatus, ApiError> {
+    let setup_provider = state.setup_provider.clone();
+    let setup_context = state.effective_setup_context();
+    tokio::task::spawn_blocking(move || setup_provider.setup_status(&setup_context))
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SETUP_STATUS_FAILED",
+                format!("setup status task failed: {error}"),
+            )
+        })
+}
+
+async fn set_cloud_ai_token(
+    State(state): State<AppState>,
+    Json(payload): Json<CloudAiTokenRequest>,
+) -> Result<Json<CloudAiTokenStatusResponse>, ApiError> {
+    let status = state.cloud_ai_tokens.set(payload)?;
+    Ok(Json(CloudAiTokenStatusResponse { status }))
+}
+
+async fn clear_cloud_ai_token(State(state): State<AppState>) -> Json<CloudAiTokenStatusResponse> {
+    let status = state.cloud_ai_tokens.clear();
+    Json(CloudAiTokenStatusResponse { status })
+}
+
+async fn debug_cloud_ai(
+    State(state): State<AppState>,
+) -> Result<Json<CloudAiDebugResponse>, ApiError> {
+    let token_status = state.cloud_ai_tokens.status();
+    let Some(token) = state.cloud_ai_tokens.bearer_token() else {
+        return Ok(Json(CloudAiDebugResponse {
+            provider: "tv7_cloud",
+            status: CloudAiDebugState::NotReady,
+            error: Some("AI_AUTH_REQUIRED".to_string()),
+            token: token_status,
+        }));
+    };
+    let request = CloudAiExecuteRequest {
+        messages: vec![
+            CloudAiMessage {
+                role: CloudAiMessageRole::System,
+                content: "Return exactly: ok".to_string(),
+            },
+            CloudAiMessage {
+                role: CloudAiMessageRole::User,
+                content: "Health check".to_string(),
+            },
+        ],
+        model: None,
+        temperature: Some(0.0),
+        max_tokens: Some(8),
+    };
+    match state.cloud_ai_executor.execute(&token, &request).await {
+        Ok(_) => Ok(Json(CloudAiDebugResponse {
+            provider: "tv7_cloud",
+            status: CloudAiDebugState::Ready,
+            error: None,
+            token: token_status,
+        })),
+        Err(error) => Ok(Json(CloudAiDebugResponse {
+            provider: "tv7_cloud",
+            status: CloudAiDebugState::NotReady,
+            error: Some(error.code.as_str().to_string()),
+            token: token_status,
+        })),
+    }
+}
+
+async fn transcript_intelligence(
+    State(state): State<AppState>,
+    Json(payload): Json<TranscriptIntelligenceRequest>,
+) -> Result<Json<TranscriptIntelligenceResponse>, ApiError> {
+    validate_transcript_intelligence_request(&payload)?;
+    let setup_status = resolve_setup_status(&state).await?;
+    let provider = setup_status
+        .capabilities
+        .iter()
+        .find(|capability| capability.name == "ai")
+        .filter(|capability| capability.status == SetupCapabilityState::Ready)
+        .and_then(|capability| capability.provider.clone())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "AI_AUTH_REQUIRED",
+                "AI is not ready. Configure local AI or pass a delegated TV7 cloud AI token.",
+            )
+        })?;
+
+    match provider {
+        ProviderSource::Tv7Cloud => execute_cloud_transcript_intelligence(&state, &payload)
+            .await
+            .map(Json)
+            .map_err(ApiError::from),
+        ProviderSource::Ollama | ProviderSource::Tv7Managed => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "AI_PROVIDER_UNAVAILABLE",
+            "local AI execution is not implemented for transcript intelligence yet",
+        )),
+        ProviderSource::UserPath => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AI_PROVIDER_UNAVAILABLE",
+            "user-path AI provider is not executable for transcript intelligence",
+        )),
+        ProviderSource::Bundled => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AI_PROVIDER_UNAVAILABLE",
+            "bundled AI provider is not executable for transcript intelligence",
+        )),
+        ProviderSource::Unconfigured => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AI_PROVIDER_UNAVAILABLE",
+            "AI provider is unconfigured for transcript intelligence",
+        )),
+    }
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -576,6 +1387,63 @@ async fn start_transcript_download(
     Ok((StatusCode::ACCEPTED, Json(JobCreateResponse { job })))
 }
 
+async fn start_transcript_generate(
+    State(state): State<AppState>,
+    Json(payload): Json<TranscriptGenerateRequest>,
+) -> Result<Response, ApiError> {
+    let setup_status = resolve_setup_status(&state).await?;
+    let transcription = setup_status
+        .capabilities
+        .iter()
+        .find(|capability| capability.name == "transcription");
+    if !matches!(
+        transcription.map(|capability| &capability.status),
+        Some(SetupCapabilityState::Ready)
+    ) {
+        let missing = transcription
+            .map(|capability| capability.missing.clone())
+            .filter(|missing| !missing.is_empty())
+            .unwrap_or_else(|| {
+                vec![
+                    "transcription_runtime".to_string(),
+                    "transcription_model".to_string(),
+                ]
+            });
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(SetupRequiredBody {
+                error: "TRANSCRIPTION_SETUP_REQUIRED",
+                message: "Local transcription requires a configured runtime and model.".to_string(),
+                missing,
+                setup_capability: "transcription",
+            }),
+        )
+            .into_response());
+    }
+
+    let job = state.jobs.create(JobKind::TranscriptGenerate);
+    let job_id = job.id.clone();
+    let jobs = state.jobs.clone();
+    let transcript_provider = state.transcript_provider.clone();
+    let task_jobs = jobs.clone();
+    spawn_blocking_job(jobs, job_id.clone(), move || {
+        if task_jobs.is_cancel_requested(&job_id) {
+            return;
+        }
+        task_jobs.update(&job_id, |job| {
+            job.status = JobStatus::Running;
+            job.progress = 0.1;
+            job.logs.push("started transcript generation".to_string());
+        });
+        match transcript_provider.generate_transcript(&payload) {
+            Ok(result) => complete_job(&task_jobs, &job_id, result),
+            Err(error) => fail_job(&task_jobs, &job_id, error),
+        }
+    });
+
+    Ok((StatusCode::ACCEPTED, Json(JobCreateResponse { job })).into_response())
+}
+
 async fn get_job(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -698,10 +1566,12 @@ async fn main() -> Result<()> {
     let config = AppConfig::from_env()?;
     initialize_logging(&config.log_level);
 
-    let media_engine = Arc::new(FfmpegMediaEngine::with_all_bins(
+    let media_engine = Arc::new(FfmpegMediaEngine::with_all_bins_and_transcription(
         config.ffmpeg_bin.clone(),
         config.ffprobe_bin.clone(),
         config.yt_dlp_bin.clone(),
+        config.whisper_bin.clone(),
+        config.whisper_model.clone(),
     ));
     let state = AppState {
         media_probe: media_engine.clone(),
@@ -709,7 +1579,8 @@ async fn main() -> Result<()> {
         clip_renderer: media_engine.clone(),
         url_ingestor: media_engine.clone(),
         transcript_provider: media_engine.clone(),
-        diagnostics_provider: media_engine,
+        diagnostics_provider: media_engine.clone(),
+        setup_provider: media_engine,
         jobs: JobStore::default(),
         diagnostics_context: DiagnosticsContext::new(
             env!("CARGO_PKG_VERSION"),
@@ -717,6 +1588,17 @@ async fn main() -> Result<()> {
             config.port,
             config.work_dir.clone(),
         ),
+        setup_context: SetupContext::new(
+            platform_id(),
+            config.asset_dir.clone(),
+            config.whisper_bin.clone(),
+            config.whisper_model.clone(),
+            config.ollama_bin.clone(),
+            config.ollama_model.clone(),
+            config.cloud_ai_available,
+        ),
+        cloud_ai_tokens: CloudAiTokenStore::default(),
+        cloud_ai_executor: Arc::new(BackendCloudAiClient::new(config.backend_base_url.clone())),
     };
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(config.socket_addr())
@@ -729,12 +1611,25 @@ async fn main() -> Result<()> {
         ffmpeg_bin = %config.ffmpeg_bin,
         ffprobe_bin = %config.ffprobe_bin,
         yt_dlp_bin = %config.yt_dlp_bin,
+        asset_dir = %config.asset_dir.display(),
         "tv7 engine service listening"
     );
     axum::serve(listener, app)
         .await
         .context("service stopped")?;
     Ok(())
+}
+
+fn parse_bool(value: &str) -> Result<bool> {
+    match value {
+        "1" | "true" | "TRUE" | "True" => Ok(true),
+        "0" | "false" | "FALSE" | "False" => Ok(false),
+        _ => anyhow::bail!("expected true or false, got {value}"),
+    }
+}
+
+fn platform_id() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
 fn initialize_logging(default_log_level: &str) {
@@ -754,11 +1649,13 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use engine_core::{
-        CapabilityDiagnostic, DiagnosticStatus, ToolDiagnostic, TranscriptDownloadResult,
-        UrlIngestResult, WorkDirDiagnostic,
+        AiProviderCandidate, CapabilityDiagnostic, DiagnosticStatus, ProviderCandidateStatus,
+        ProviderSource, SetupCapabilityState, SetupCapabilityStatus, ToolDiagnostic,
+        TranscriptDownloadResult, UrlIngestResult, WorkDirDiagnostic,
     };
     use serde::ser::{Error as SerError, SerializeStruct};
     use std::collections::BTreeSet;
+    use std::sync::Mutex as StdMutex;
     use tower::ServiceExt;
 
     #[derive(Debug)]
@@ -832,6 +1729,91 @@ mod tests {
         }
     }
 
+    impl RuntimeSetupProvider for MockMediaProbe {
+        fn setup_manifest(&self, context: &SetupContext) -> SetupManifest {
+            SetupManifest {
+                schema_version: 1,
+                platform: context.platform.clone(),
+                setup_modes: vec!["automatic".to_string(), "disabled".to_string()],
+                ai_provider_order: Vec::new(),
+                assets: Vec::new(),
+            }
+        }
+
+        fn setup_status(&self, _context: &SetupContext) -> SetupStatus {
+            let transcription_ready =
+                _context.whisper_bin.is_some() && _context.whisper_model.is_some();
+            SetupStatus {
+                schema_version: 1,
+                setup_complete: false,
+                active_ai_provider: if _context.cloud_ai_available {
+                    Some(ProviderSource::Tv7Cloud)
+                } else {
+                    None
+                },
+                assets: Vec::new(),
+                ai_providers: vec![AiProviderCandidate {
+                    source: ProviderSource::Tv7Cloud,
+                    status: if _context.cloud_ai_available {
+                        ProviderCandidateStatus::Ready
+                    } else {
+                        ProviderCandidateStatus::Unavailable
+                    },
+                    required_assets: Vec::new(),
+                    requires_internet: true,
+                    requires_user_confirmation: false,
+                    cost_policy: "tv7_managed_usage".to_string(),
+                    action: None,
+                }],
+                capabilities: vec![
+                    SetupCapabilityStatus {
+                        name: "transcription".to_string(),
+                        status: if transcription_ready {
+                            SetupCapabilityState::Ready
+                        } else {
+                            SetupCapabilityState::NotReady
+                        },
+                        provider: if transcription_ready {
+                            Some(ProviderSource::UserPath)
+                        } else {
+                            None
+                        },
+                        missing: if transcription_ready {
+                            Vec::new()
+                        } else {
+                            vec![
+                                "transcription_runtime".to_string(),
+                                "transcription_model".to_string(),
+                            ]
+                        },
+                        installable: true,
+                        user_action_required: !transcription_ready,
+                    },
+                    SetupCapabilityStatus {
+                        name: "ai".to_string(),
+                        status: if _context.cloud_ai_available {
+                            SetupCapabilityState::Ready
+                        } else {
+                            SetupCapabilityState::NotReady
+                        },
+                        provider: if _context.cloud_ai_available {
+                            Some(ProviderSource::Tv7Cloud)
+                        } else {
+                            None
+                        },
+                        missing: if _context.cloud_ai_available {
+                            Vec::new()
+                        } else {
+                            vec!["cloud_ai_delegation_token".to_string()]
+                        },
+                        installable: true,
+                        user_action_required: !_context.cloud_ai_available,
+                    },
+                ],
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct PanicUrlIngestor;
 
@@ -844,6 +1826,63 @@ mod tests {
     #[derive(Debug)]
     struct SlowTranscriptProvider;
 
+    #[derive(Debug, Default)]
+    struct RecordingCloudAiExecutor {
+        calls: StdMutex<Vec<(String, CloudAiExecuteRequest)>>,
+        response: StdMutex<Option<Result<CloudAiExecuteResponse, CloudAiError>>>,
+    }
+
+    impl RecordingCloudAiExecutor {
+        fn with_response(response: Result<CloudAiExecuteResponse, CloudAiError>) -> Self {
+            Self {
+                calls: StdMutex::new(Vec::new()),
+                response: StdMutex::new(Some(response)),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, CloudAiExecuteRequest)> {
+            self.calls
+                .lock()
+                .expect("calls mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    impl CloudAiExecutor for RecordingCloudAiExecutor {
+        fn execute<'a>(
+            &'a self,
+            token: &'a str,
+            request: &'a CloudAiExecuteRequest,
+        ) -> CloudAiExecuteFuture<'a> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .expect("calls mutex should not be poisoned")
+                    .push((token.to_string(), request.clone()));
+                self.response
+                    .lock()
+                    .expect("response mutex should not be poisoned")
+                    .clone()
+                    .unwrap_or_else(|| {
+                        Ok(CloudAiExecuteResponse {
+                            provider: "deepseek".to_string(),
+                            model: "deepseek-chat".to_string(),
+                            content: r#"{"clips":[{"title":"Strong opening","start_seconds":1.0,"end_seconds":31.0,"reason":"Clear hook and useful standalone segment.","score":0.91}]}"#.to_string(),
+                            usage: CloudAiUsage {
+                                credits_charged: 1,
+                                credits_remaining: 9,
+                                prompt_tokens: Some(1),
+                                completion_tokens: Some(1),
+                                total_tokens: Some(2),
+                                latency_ms: Some(10),
+                            },
+                            raw_finish_reason: Some("stop".to_string()),
+                        })
+                    })
+            })
+        }
+    }
+
     impl TranscriptProvider for SlowTranscriptProvider {
         fn download_transcript(
             &self,
@@ -852,6 +1891,18 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             Ok(TranscriptDownloadResult {
                 transcript_path: Some(request.output_path.clone()),
+                language: request.language.clone().unwrap_or_else(|| "en".to_string()),
+            })
+        }
+
+        fn generate_transcript(
+            &self,
+            request: &TranscriptGenerateRequest,
+        ) -> Result<engine_core::TranscriptGenerateResult, EngineError> {
+            std::thread::sleep(Duration::from_millis(100));
+            Ok(engine_core::TranscriptGenerateResult {
+                transcript_path: request.output_path.clone(),
+                format: "vtt".to_string(),
                 language: request.language.clone().unwrap_or_else(|| "en".to_string()),
             })
         }
@@ -867,9 +1918,27 @@ mod tests {
                 language: request.language.clone().unwrap_or_else(|| "en".to_string()),
             })
         }
+
+        fn generate_transcript(
+            &self,
+            request: &TranscriptGenerateRequest,
+        ) -> Result<engine_core::TranscriptGenerateResult, EngineError> {
+            Ok(engine_core::TranscriptGenerateResult {
+                transcript_path: request.output_path.clone(),
+                format: "vtt".to_string(),
+                language: request.language.clone().unwrap_or_else(|| "en".to_string()),
+            })
+        }
     }
 
     fn router_with_probe(response: Result<MediaMetadata, EngineError>) -> Router {
+        router_with_probe_and_setup_context(response, test_setup_context())
+    }
+
+    fn router_with_probe_and_setup_context(
+        response: Result<MediaMetadata, EngineError>,
+        setup_context: SetupContext,
+    ) -> Router {
         let mock = Arc::new(MockMediaProbe {
             probe_response: response,
             thumbnail_response: Ok(ThumbnailResult {
@@ -886,7 +1955,8 @@ mod tests {
             clip_renderer: mock.clone(),
             url_ingestor: mock.clone(),
             transcript_provider: mock.clone(),
-            diagnostics_provider: mock,
+            diagnostics_provider: mock.clone(),
+            setup_provider: mock,
             jobs: JobStore::default(),
             diagnostics_context: DiagnosticsContext::new(
                 env!("CARGO_PKG_VERSION"),
@@ -894,6 +1964,9 @@ mod tests {
                 7070,
                 std::env::temp_dir(),
             ),
+            setup_context,
+            cloud_ai_tokens: CloudAiTokenStore::default(),
+            cloud_ai_executor: Arc::new(RecordingCloudAiExecutor::default()),
         })
     }
 
@@ -943,6 +2016,49 @@ mod tests {
         (status, json)
     }
 
+    fn test_setup_context() -> SetupContext {
+        SetupContext::new(
+            "test-platform",
+            std::env::temp_dir().join("tv7-engine-test-assets"),
+            None,
+            None,
+            "ollama",
+            None,
+            true,
+        )
+    }
+
+    fn ready_transcription_setup_context() -> SetupContext {
+        SetupContext::new(
+            "test-platform",
+            std::env::temp_dir().join("tv7-engine-test-assets"),
+            Some("whisper-cli".to_string()),
+            Some(std::env::temp_dir().join("model.bin")),
+            "ollama",
+            None,
+            true,
+        )
+    }
+
+    fn test_config_values(work_dir: PathBuf) -> AppConfigValues {
+        AppConfigValues {
+            host: Some("127.0.0.1".to_string()),
+            port: Some("7070".to_string()),
+            log_level: None,
+            work_dir,
+            asset_dir: None,
+            ffmpeg_bin: None,
+            ffprobe_bin: None,
+            yt_dlp_bin: None,
+            whisper_bin: None,
+            whisper_model: None,
+            ollama_bin: None,
+            ollama_model: None,
+            cloud_ai_available: None,
+            backend_base_url: None,
+        }
+    }
+
     #[test]
     fn openapi_contract_declares_every_runtime_route() {
         let openapi = engine_openapi();
@@ -952,11 +2068,17 @@ mod tests {
         let actual_routes = BTreeSet::from([
             "/health",
             "/v1/diagnostics",
+            "/v1/ai/cloud-debug",
+            "/v1/ai/cloud-token",
+            "/v1/ai/transcript-intelligence",
+            "/v1/setup/manifest",
+            "/v1/setup/status",
             "/v1/media/probe",
             "/v1/media/thumbnail",
             "/v1/media/render-clip",
             "/v1/ingest/url",
             "/v1/transcripts/download",
+            "/v1/transcripts/generate",
             "/v1/jobs/{id}",
             "/v1/jobs/{id}/logs",
             "/v1/jobs/{id}/cancel",
@@ -981,6 +2103,39 @@ mod tests {
         let cases = [
             ("get", "/health", "GET", "/health", None),
             ("get", "/v1/diagnostics", "GET", "/v1/diagnostics", None),
+            (
+                "post",
+                "/v1/ai/cloud-token",
+                "POST",
+                "/v1/ai/cloud-token",
+                Some(
+                    r#"{"token":"delegated-token","token_type":"bearer","scope":"engine:cloud_ai","expires_in_seconds":300,"credits_remaining":10}"#,
+                ),
+            ),
+            (
+                "post",
+                "/v1/ai/cloud-debug",
+                "POST",
+                "/v1/ai/cloud-debug",
+                None,
+            ),
+            (
+                "post",
+                "/v1/ai/transcript-intelligence",
+                "POST",
+                "/v1/ai/transcript-intelligence",
+                Some(
+                    r#"{"transcript":[{"start_seconds":1.0,"end_seconds":5.0,"text":"This is a useful hook."}],"clip_duration":"medium","timeline_target":"entire_video","max_suggestions":3}"#,
+                ),
+            ),
+            (
+                "get",
+                "/v1/setup/manifest",
+                "GET",
+                "/v1/setup/manifest",
+                None,
+            ),
+            ("get", "/v1/setup/status", "GET", "/v1/setup/status", None),
             (
                 "post",
                 "/v1/media/probe",
@@ -1022,11 +2177,35 @@ mod tests {
                     r#"{"url":"https://example.com/video","output_path":"/tmp/video.vtt","language":"en"}"#,
                 ),
             ),
+            (
+                "post",
+                "/v1/transcripts/generate",
+                "POST",
+                "/v1/transcripts/generate",
+                Some(
+                    r#"{"media_path":"/tmp/video.mp4","output_path":"/tmp/video.vtt","language":"en"}"#,
+                ),
+            ),
         ];
 
         for (contract_method, contract_path, request_method, request_uri, request_body) in cases {
+            let request_app = if contract_path == "/v1/transcripts/generate" {
+                router_with_probe_and_setup_context(
+                    Ok(MediaMetadata {
+                        path: "/tmp/file.mp4".to_string(),
+                        duration_seconds: Some(10.0),
+                        width: Some(1920),
+                        height: Some(1080),
+                        format: "mp4".to_string(),
+                        size_bytes: 1024,
+                    }),
+                    ready_transcription_setup_context(),
+                )
+            } else {
+                app.clone()
+            };
             let (status, body) =
-                request_json(app.clone(), request_method, request_uri, request_body).await;
+                request_json(request_app, request_method, request_uri, request_body).await;
             assert!(
                 success_statuses_for(&openapi, contract_path, contract_method)
                     .contains(&status.as_u16()),
@@ -1035,6 +2214,12 @@ mod tests {
         }
 
         for (contract_method, contract_path, request_method, request_uri) in [
+            (
+                "delete",
+                "/v1/ai/cloud-token",
+                "DELETE",
+                "/v1/ai/cloud-token",
+            ),
             ("get", "/v1/jobs/{id}", "GET", "/v1/jobs/job_1"),
             ("get", "/v1/jobs/{id}/logs", "GET", "/v1/jobs/job_1/logs"),
             (
@@ -1070,6 +2255,70 @@ mod tests {
         let (_, diagnostics) = request_json(app.clone(), "GET", "/v1/diagnostics", None).await;
         for key in ["status", "runtime", "capabilities", "tools", "work_dir"] {
             assert!(diagnostics.get(key).is_some(), "missing diagnostics.{key}");
+        }
+
+        let (_, cloud_token) = request_json(
+            app.clone(),
+            "POST",
+            "/v1/ai/cloud-token",
+            Some(
+                r#"{"token":"delegated-token","token_type":"bearer","scope":"engine:cloud_ai","expires_in_seconds":300,"credits_remaining":10}"#,
+            ),
+        )
+        .await;
+        assert!(cloud_token["status"].get("state").is_some());
+        assert!(cloud_token["status"].get("expires_in_seconds").is_some());
+        assert!(cloud_token["status"].get("token").is_none());
+
+        let (_, cloud_debug) = request_json(app.clone(), "POST", "/v1/ai/cloud-debug", None).await;
+        for key in ["provider", "status", "error", "token"] {
+            assert!(cloud_debug.get(key).is_some(), "missing cloud_debug.{key}");
+        }
+
+        let (_, intelligence) = request_json(
+            app.clone(),
+            "POST",
+            "/v1/ai/transcript-intelligence",
+            Some(
+                r#"{"transcript":[{"start_seconds":1.0,"end_seconds":5.0,"text":"This is a useful hook."}],"clip_duration":"medium","timeline_target":"entire_video","max_suggestions":3}"#,
+            ),
+        )
+        .await;
+        for key in ["provider", "model", "clips", "usage"] {
+            assert!(
+                intelligence.get(key).is_some(),
+                "missing transcript_intelligence.{key}"
+            );
+        }
+
+        let (_, setup_manifest) =
+            request_json(app.clone(), "GET", "/v1/setup/manifest", None).await;
+        for key in [
+            "schema_version",
+            "platform",
+            "setup_modes",
+            "ai_provider_order",
+            "assets",
+        ] {
+            assert!(
+                setup_manifest.get(key).is_some(),
+                "missing setup_manifest.{key}"
+            );
+        }
+
+        let (_, setup_status) = request_json(app.clone(), "GET", "/v1/setup/status", None).await;
+        for key in [
+            "schema_version",
+            "setup_complete",
+            "active_ai_provider",
+            "assets",
+            "ai_providers",
+            "capabilities",
+        ] {
+            assert!(
+                setup_status.get(key).is_some(),
+                "missing setup_status.{key}"
+            );
         }
 
         let (_, probe) = request_json(
@@ -1143,16 +2392,9 @@ mod tests {
 
     #[test]
     fn config_rejects_non_loopback_host() {
-        let error = AppConfig::from_values(
-            Some("0.0.0.0"),
-            Some("7070"),
-            None,
-            std::env::temp_dir(),
-            None,
-            None,
-            None,
-        )
-        .expect_err("non-loopback host should fail");
+        let mut values = test_config_values(std::env::temp_dir());
+        values.host = Some("0.0.0.0".to_string());
+        let error = AppConfig::from_values(values).expect_err("non-loopback host should fail");
 
         assert!(
             error.to_string().contains("must be loopback"),
@@ -1162,19 +2404,26 @@ mod tests {
 
     #[test]
     fn config_rejects_relative_work_dir() {
-        let error = AppConfig::from_values(
-            Some("127.0.0.1"),
-            Some("7070"),
-            None,
-            PathBuf::from("relative-work-dir"),
-            None,
-            None,
-            None,
-        )
-        .expect_err("relative work dir should fail");
+        let error = AppConfig::from_values(test_config_values(PathBuf::from("relative-work-dir")))
+            .expect_err("relative work dir should fail");
 
         assert!(
             error.to_string().contains("must be an absolute path"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_relative_whisper_model_path() {
+        let mut values = test_config_values(std::env::temp_dir());
+        values.whisper_model = Some(PathBuf::from("models/whisper.bin"));
+        let error =
+            AppConfig::from_values(values).expect_err("relative whisper model path should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("TV7_ENGINE_WHISPER_MODEL must be an absolute path"),
             "unexpected error: {error:#}"
         );
     }
@@ -1280,6 +2529,334 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cloud_token_endpoint_keeps_token_out_of_responses() {
+        let app = router_with_probe(Err(EngineError::Io("unused".to_string())));
+
+        let (status, body) = request_json(
+            app.clone(),
+            "POST",
+            "/v1/ai/cloud-token",
+            Some(
+                r#"{"token":"secret-delegated-token","token_type":"bearer","scope":"engine:cloud_ai","expires_in_seconds":300,"credits_remaining":42}"#,
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"]["state"], "configured");
+        assert_eq!(body["status"]["scope"], "engine:cloud_ai");
+        assert_eq!(body["status"]["credits_remaining"], 42);
+        assert!(
+            !body.to_string().contains("secret-delegated-token"),
+            "token leaked in response: {body}"
+        );
+
+        let (_, setup_status) = request_json(app, "GET", "/v1/setup/status", None).await;
+        assert_eq!(setup_status["active_ai_provider"], "tv7_cloud");
+        assert!(
+            !setup_status.to_string().contains("secret-delegated-token"),
+            "token leaked in setup status: {setup_status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_token_clear_makes_cloud_ai_unavailable() {
+        let app = router_with_probe(Err(EngineError::Io("unused".to_string())));
+
+        let _ = request_json(
+            app.clone(),
+            "POST",
+            "/v1/ai/cloud-token",
+            Some(
+                r#"{"token":"delegated-token","token_type":"bearer","scope":"engine:cloud_ai","expires_in_seconds":300}"#,
+            ),
+        )
+        .await;
+
+        let (_, ready_status) = request_json(app.clone(), "GET", "/v1/setup/status", None).await;
+        assert_eq!(ready_status["active_ai_provider"], "tv7_cloud");
+
+        let (clear_status, clear_body) =
+            request_json(app.clone(), "DELETE", "/v1/ai/cloud-token", None).await;
+        assert_eq!(clear_status, StatusCode::OK);
+        assert_eq!(clear_body["status"]["state"], "missing");
+
+        let (_, not_ready_status) = request_json(app, "GET", "/v1/setup/status", None).await;
+        assert_eq!(
+            not_ready_status["active_ai_provider"],
+            serde_json::Value::Null
+        );
+        let ai_capability = not_ready_status["capabilities"]
+            .as_array()
+            .expect("capabilities should be an array")
+            .iter()
+            .find(|capability| capability["name"] == "ai")
+            .expect("ai capability should be present");
+        assert_eq!(ai_capability["status"], "not_ready");
+        assert_eq!(ai_capability["missing"][0], "cloud_ai_delegation_token");
+    }
+
+    #[tokio::test]
+    async fn cloud_debug_uses_delegated_bearer_token() {
+        let mock = Arc::new(MockMediaProbe {
+            probe_response: Err(EngineError::Io("unused".to_string())),
+            thumbnail_response: Ok(ThumbnailResult {
+                output_path: "/tmp/thumb.jpg".to_string(),
+            }),
+            render_response: Ok(RenderClipResult {
+                output_path: "/tmp/clip.mp4".to_string(),
+                duration_seconds: 10.0,
+            }),
+        });
+        let cloud = Arc::new(RecordingCloudAiExecutor::default());
+        let app = build_router(AppState {
+            media_probe: mock.clone(),
+            thumbnail_generator: mock.clone(),
+            clip_renderer: mock.clone(),
+            url_ingestor: mock.clone(),
+            transcript_provider: mock.clone(),
+            diagnostics_provider: mock.clone(),
+            setup_provider: mock,
+            jobs: JobStore::default(),
+            diagnostics_context: DiagnosticsContext::new(
+                env!("CARGO_PKG_VERSION"),
+                "127.0.0.1",
+                7070,
+                std::env::temp_dir(),
+            ),
+            setup_context: test_setup_context(),
+            cloud_ai_tokens: CloudAiTokenStore::default(),
+            cloud_ai_executor: cloud.clone(),
+        });
+
+        let _ = request_json(
+            app.clone(),
+            "POST",
+            "/v1/ai/cloud-token",
+            Some(
+                r#"{"token":"delegated-token","token_type":"bearer","scope":"engine:cloud_ai","expires_in_seconds":300}"#,
+            ),
+        )
+        .await;
+
+        let (status, body) = request_json(app, "POST", "/v1/ai/cloud-debug", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        let calls = cloud.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "delegated-token");
+        assert_eq!(calls[0].1.messages[0].role, CloudAiMessageRole::System);
+    }
+
+    #[tokio::test]
+    async fn cloud_debug_normalizes_backend_errors() {
+        let mock = Arc::new(MockMediaProbe {
+            probe_response: Err(EngineError::Io("unused".to_string())),
+            thumbnail_response: Ok(ThumbnailResult {
+                output_path: "/tmp/thumb.jpg".to_string(),
+            }),
+            render_response: Ok(RenderClipResult {
+                output_path: "/tmp/clip.mp4".to_string(),
+                duration_seconds: 10.0,
+            }),
+        });
+        let cloud = Arc::new(RecordingCloudAiExecutor::with_response(Err(CloudAiError {
+            code: CloudAiErrorCode::QuotaExceeded,
+            message: "quota exhausted".to_string(),
+        })));
+        let app = build_router(AppState {
+            media_probe: mock.clone(),
+            thumbnail_generator: mock.clone(),
+            clip_renderer: mock.clone(),
+            url_ingestor: mock.clone(),
+            transcript_provider: mock.clone(),
+            diagnostics_provider: mock.clone(),
+            setup_provider: mock,
+            jobs: JobStore::default(),
+            diagnostics_context: DiagnosticsContext::new(
+                env!("CARGO_PKG_VERSION"),
+                "127.0.0.1",
+                7070,
+                std::env::temp_dir(),
+            ),
+            setup_context: test_setup_context(),
+            cloud_ai_tokens: CloudAiTokenStore::default(),
+            cloud_ai_executor: cloud,
+        });
+
+        let _ = request_json(
+            app.clone(),
+            "POST",
+            "/v1/ai/cloud-token",
+            Some(
+                r#"{"token":"delegated-token","token_type":"bearer","scope":"engine:cloud_ai","expires_in_seconds":300}"#,
+            ),
+        )
+        .await;
+
+        let (status, body) = request_json(app, "POST", "/v1/ai/cloud-debug", None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["error"], "AI_QUOTA_EXCEEDED");
+        assert!(!body.to_string().contains("delegated-token"));
+    }
+
+    #[tokio::test]
+    async fn transcript_intelligence_dispatches_to_cloud_ai() {
+        let mock = Arc::new(MockMediaProbe {
+            probe_response: Err(EngineError::Io("unused".to_string())),
+            thumbnail_response: Ok(ThumbnailResult {
+                output_path: "/tmp/thumb.jpg".to_string(),
+            }),
+            render_response: Ok(RenderClipResult {
+                output_path: "/tmp/clip.mp4".to_string(),
+                duration_seconds: 10.0,
+            }),
+        });
+        let cloud = Arc::new(RecordingCloudAiExecutor::default());
+        let app = build_router(AppState {
+            media_probe: mock.clone(),
+            thumbnail_generator: mock.clone(),
+            clip_renderer: mock.clone(),
+            url_ingestor: mock.clone(),
+            transcript_provider: mock.clone(),
+            diagnostics_provider: mock.clone(),
+            setup_provider: mock,
+            jobs: JobStore::default(),
+            diagnostics_context: DiagnosticsContext::new(
+                env!("CARGO_PKG_VERSION"),
+                "127.0.0.1",
+                7070,
+                std::env::temp_dir(),
+            ),
+            setup_context: test_setup_context(),
+            cloud_ai_tokens: CloudAiTokenStore::default(),
+            cloud_ai_executor: cloud.clone(),
+        });
+
+        let _ = request_json(
+            app.clone(),
+            "POST",
+            "/v1/ai/cloud-token",
+            Some(
+                r#"{"token":"delegated-token","token_type":"bearer","scope":"engine:cloud_ai","expires_in_seconds":300}"#,
+            ),
+        )
+        .await;
+        let (status, body) = request_json(
+            app,
+            "POST",
+            "/v1/ai/transcript-intelligence",
+            Some(
+                r#"{"transcript":[{"start_seconds":1.0,"end_seconds":7.0,"text":"Here is the main insight."}],"clip_duration":"medium","timeline_target":"entire_video","max_suggestions":2}"#,
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["provider"], "tv7_cloud");
+        assert_eq!(body["model"], "deepseek-chat");
+        assert_eq!(body["clips"][0]["title"], "Strong opening");
+        assert!(!body.to_string().contains("delegated-token"));
+
+        let calls = cloud.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "delegated-token");
+        assert!(calls[0].1.messages[1].content.contains("main insight"));
+    }
+
+    #[tokio::test]
+    async fn transcript_intelligence_requires_ready_ai_provider() {
+        let app = router_with_probe(Err(EngineError::Io("unused".to_string())));
+
+        let (status, body) = request_json(
+            app,
+            "POST",
+            "/v1/ai/transcript-intelligence",
+            Some(
+                r#"{"transcript":[{"start_seconds":1.0,"end_seconds":7.0,"text":"Here is the main insight."}],"clip_duration":"medium","timeline_target":"entire_video"}"#,
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "AI_AUTH_REQUIRED");
+    }
+
+    #[tokio::test]
+    async fn transcript_intelligence_rejects_invalid_cloud_json() {
+        let mock = Arc::new(MockMediaProbe {
+            probe_response: Err(EngineError::Io("unused".to_string())),
+            thumbnail_response: Ok(ThumbnailResult {
+                output_path: "/tmp/thumb.jpg".to_string(),
+            }),
+            render_response: Ok(RenderClipResult {
+                output_path: "/tmp/clip.mp4".to_string(),
+                duration_seconds: 10.0,
+            }),
+        });
+        let cloud = Arc::new(RecordingCloudAiExecutor::with_response(Ok(
+            CloudAiExecuteResponse {
+                provider: "deepseek".to_string(),
+                model: "deepseek-chat".to_string(),
+                content: "not json".to_string(),
+                usage: CloudAiUsage {
+                    credits_charged: 1,
+                    credits_remaining: 9,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    total_tokens: None,
+                    latency_ms: None,
+                },
+                raw_finish_reason: None,
+            },
+        )));
+        let app = build_router(AppState {
+            media_probe: mock.clone(),
+            thumbnail_generator: mock.clone(),
+            clip_renderer: mock.clone(),
+            url_ingestor: mock.clone(),
+            transcript_provider: mock.clone(),
+            diagnostics_provider: mock.clone(),
+            setup_provider: mock,
+            jobs: JobStore::default(),
+            diagnostics_context: DiagnosticsContext::new(
+                env!("CARGO_PKG_VERSION"),
+                "127.0.0.1",
+                7070,
+                std::env::temp_dir(),
+            ),
+            setup_context: test_setup_context(),
+            cloud_ai_tokens: CloudAiTokenStore::default(),
+            cloud_ai_executor: cloud,
+        });
+
+        let _ = request_json(
+            app.clone(),
+            "POST",
+            "/v1/ai/cloud-token",
+            Some(
+                r#"{"token":"delegated-token","token_type":"bearer","scope":"engine:cloud_ai","expires_in_seconds":300}"#,
+            ),
+        )
+        .await;
+        let (status, body) = request_json(
+            app,
+            "POST",
+            "/v1/ai/transcript-intelligence",
+            Some(
+                r#"{"transcript":[{"start_seconds":1.0,"end_seconds":7.0,"text":"Here is the main insight."}],"clip_duration":"medium","timeline_target":"entire_video"}"#,
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "AI_PROVIDER_UNAVAILABLE");
+    }
+
+    #[tokio::test]
     async fn thumbnail_endpoint_returns_output_path() {
         let app = router_with_probe(Err(EngineError::Io("unused".to_string())));
 
@@ -1371,6 +2948,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transcript_generate_requires_ready_local_transcription_setup() {
+        let app = router_with_probe(Err(EngineError::Io("unused".to_string())));
+
+        let (status, body) = request_json(
+            app,
+            "POST",
+            "/v1/transcripts/generate",
+            Some(
+                r#"{"media_path":"/tmp/video.mp4","output_path":"/tmp/video.vtt","language":"en"}"#,
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "TRANSCRIPTION_SETUP_REQUIRED");
+        assert_eq!(body["setup_capability"], "transcription");
+        assert!(
+            body["missing"]
+                .as_array()
+                .expect("missing should be an array")
+                .contains(&serde_json::json!("transcription_runtime"))
+        );
+        assert!(
+            body["missing"]
+                .as_array()
+                .expect("missing should be an array")
+                .contains(&serde_json::json!("transcription_model"))
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_generate_endpoint_creates_job_when_setup_ready() {
+        let app = router_with_probe_and_setup_context(
+            Err(EngineError::Io("unused".to_string())),
+            ready_transcription_setup_context(),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/transcripts/generate")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"media_path":"/tmp/video.mp4","output_path":"/tmp/video.vtt","language":"en"}"#,
+                    ))
+                    .expect("request should be valid"),
+            )
+            .await
+            .expect("transcript generate request should complete");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("job body should be readable");
+        let body = String::from_utf8(body.to_vec()).expect("body should be utf8");
+        assert!(body.contains("transcript_generate"));
+        assert!(body.contains("job_"));
+    }
+
+    #[tokio::test]
     async fn job_logs_endpoint_returns_logs() {
         let app = router_with_probe(Err(EngineError::Io("unused".to_string())));
 
@@ -1427,7 +3065,8 @@ mod tests {
             clip_renderer: mock.clone(),
             url_ingestor: mock.clone(),
             transcript_provider: Arc::new(SlowTranscriptProvider),
-            diagnostics_provider: mock,
+            diagnostics_provider: mock.clone(),
+            setup_provider: mock,
             jobs: JobStore::default(),
             diagnostics_context: DiagnosticsContext::new(
                 env!("CARGO_PKG_VERSION"),
@@ -1435,6 +3074,9 @@ mod tests {
                 7070,
                 std::env::temp_dir(),
             ),
+            setup_context: test_setup_context(),
+            cloud_ai_tokens: CloudAiTokenStore::default(),
+            cloud_ai_executor: Arc::new(RecordingCloudAiExecutor::default()),
         });
 
         let create_response = app
@@ -1491,7 +3133,8 @@ mod tests {
             clip_renderer: mock.clone(),
             url_ingestor: Arc::new(PanicUrlIngestor),
             transcript_provider: mock.clone(),
-            diagnostics_provider: mock,
+            diagnostics_provider: mock.clone(),
+            setup_provider: mock,
             jobs: JobStore::default(),
             diagnostics_context: DiagnosticsContext::new(
                 env!("CARGO_PKG_VERSION"),
@@ -1499,6 +3142,9 @@ mod tests {
                 7070,
                 std::env::temp_dir(),
             ),
+            setup_context: test_setup_context(),
+            cloud_ai_tokens: CloudAiTokenStore::default(),
+            cloud_ai_executor: Arc::new(RecordingCloudAiExecutor::default()),
         });
 
         let create_response = app
