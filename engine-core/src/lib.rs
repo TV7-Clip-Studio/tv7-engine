@@ -1774,6 +1774,35 @@ mod tests {
         }
     }
 
+    struct TestTempDir {
+        path: PathBuf,
+    }
+
+    impl TestTempDir {
+        fn new(prefix: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "{prefix}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time should be after epoch")
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&path).expect("temp root should be created");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
     fn success_output(stdout: &[u8]) -> ToolOutput {
         ToolOutput {
             status_success: true,
@@ -2206,18 +2235,10 @@ mod tests {
 
     #[test]
     fn generate_transcript_runs_configured_whisper_and_returns_vtt_path() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "tv7-engine-transcript-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time should be after epoch")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&temp_root).expect("temp root should be created");
-        let media_path = temp_root.join("video.mp4");
-        let model_path = temp_root.join("ggml-base.bin");
-        let output_path = temp_root.join("video.vtt");
+        let temp_root = TestTempDir::new("tv7-engine-transcript-test");
+        let media_path = temp_root.path().join("video.mp4");
+        let model_path = temp_root.path().join("ggml-base.bin");
+        let output_path = temp_root.path().join("video.vtt");
         fs::write(&media_path, b"fake video").expect("media file should be created");
         fs::write(&model_path, b"fake model").expect("model file should be created");
         let executor = Arc::new(TranscriptExecutor::new());
@@ -2250,7 +2271,6 @@ mod tests {
                 .1
                 .contains(&model_path.to_string_lossy().to_string())
         );
-        fs::remove_dir_all(temp_root).expect("temp root should be removed");
     }
 
     #[test]

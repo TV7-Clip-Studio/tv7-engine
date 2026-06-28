@@ -1126,13 +1126,23 @@ async fn setup_manifest(State(state): State<AppState>) -> Json<SetupManifest> {
     Json(state.setup_provider.setup_manifest(&state.setup_context))
 }
 
-async fn setup_status(State(state): State<AppState>) -> Json<SetupStatus> {
+async fn setup_status(State(state): State<AppState>) -> Result<Json<SetupStatus>, ApiError> {
     debug!("setup status endpoint called");
-    Json(
-        state
-            .setup_provider
-            .setup_status(&state.effective_setup_context()),
-    )
+    Ok(Json(resolve_setup_status(&state).await?))
+}
+
+async fn resolve_setup_status(state: &AppState) -> Result<SetupStatus, ApiError> {
+    let setup_provider = state.setup_provider.clone();
+    let setup_context = state.effective_setup_context();
+    tokio::task::spawn_blocking(move || setup_provider.setup_status(&setup_context))
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "SETUP_STATUS_FAILED",
+                format!("setup status task failed: {error}"),
+            )
+        })
 }
 
 async fn set_cloud_ai_token(
@@ -1196,9 +1206,7 @@ async fn transcript_intelligence(
     Json(payload): Json<TranscriptIntelligenceRequest>,
 ) -> Result<Json<TranscriptIntelligenceResponse>, ApiError> {
     validate_transcript_intelligence_request(&payload)?;
-    let setup_status = state
-        .setup_provider
-        .setup_status(&state.effective_setup_context());
+    let setup_status = resolve_setup_status(&state).await?;
     let provider = setup_status
         .capabilities
         .iter()
@@ -1223,10 +1231,20 @@ async fn transcript_intelligence(
             "AI_PROVIDER_UNAVAILABLE",
             "local AI execution is not implemented for transcript intelligence yet",
         )),
-        _ => Err(ApiError::new(
+        ProviderSource::UserPath => Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "AI_PROVIDER_UNAVAILABLE",
-            "resolved AI provider is not executable",
+            "user-path AI provider is not executable for transcript intelligence",
+        )),
+        ProviderSource::Bundled => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AI_PROVIDER_UNAVAILABLE",
+            "bundled AI provider is not executable for transcript intelligence",
+        )),
+        ProviderSource::Unconfigured => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AI_PROVIDER_UNAVAILABLE",
+            "AI provider is unconfigured for transcript intelligence",
         )),
     }
 }
@@ -1373,9 +1391,7 @@ async fn start_transcript_generate(
     State(state): State<AppState>,
     Json(payload): Json<TranscriptGenerateRequest>,
 ) -> Result<Response, ApiError> {
-    let setup_status = state
-        .setup_provider
-        .setup_status(&state.effective_setup_context());
+    let setup_status = resolve_setup_status(&state).await?;
     let transcription = setup_status
         .capabilities
         .iter()
