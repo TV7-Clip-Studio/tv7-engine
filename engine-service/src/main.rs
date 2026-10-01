@@ -1,30 +1,41 @@
 use anyhow::{Context, Result};
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, Multipart, Request, State};
+use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use engine_core::{
-    ClipRenderer, DiagnosticStatus, DiagnosticsContext, DiagnosticsProvider, EngineDiagnostics,
-    EngineError, FfmpegMediaEngine, MediaMetadata, MediaProbe, ProviderSource, RenderClipRequest,
+    CandidateRequest, CandidateResponse, ChannelDiscoverRequest, ChannelPage, ClipRenderer,
+    DiagnosticStatus, DiagnosticsContext, DiagnosticsProvider, EngineDiagnostics, EngineError,
+    FfmpegMediaEngine, MediaMetadata, MediaProbe, ProviderSource, RenderClipRequest,
     RenderClipResult, RuntimeSetupProvider, SetupCapabilityState, SetupContext, SetupManifest,
     SetupStatus, ThumbnailGenerator, ThumbnailRequest, ThumbnailResult, TranscriptDownloadRequest,
     TranscriptGenerateRequest, TranscriptProvider, UrlIngestRequest, UrlIngestor,
+    generate_candidates, inspect_vtt, valid_youtube_video_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
+use std::fs;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Semaphore;
+use tokio_util::io::ReaderStream;
+use tower_http::cors::CorsLayer;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 type SharedMediaProbe = Arc<dyn MediaProbe>;
 type SharedThumbnailGenerator = Arc<dyn ThumbnailGenerator>;
@@ -47,6 +58,7 @@ struct AppState {
     url_ingestor: SharedUrlIngestor,
     transcript_provider: SharedTranscriptProvider,
     jobs: JobStore,
+    exports: ExportStore,
     diagnostics_context: DiagnosticsContext,
     setup_context: SetupContext,
     cloud_ai_tokens: CloudAiTokenStore,
@@ -72,12 +84,23 @@ struct AppConfig {
     ffmpeg_bin: String,
     ffprobe_bin: String,
     yt_dlp_bin: String,
+    yt_dlp_js_runtime: Option<String>,
     whisper_bin: Option<String>,
     whisper_model: Option<PathBuf>,
     ollama_bin: String,
     ollama_model: Option<String>,
     cloud_ai_available: bool,
     backend_base_url: Option<String>,
+    api_token: Option<ApiToken>,
+}
+
+#[derive(Clone)]
+struct ApiToken(String);
+
+impl std::fmt::Debug for ApiToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
 }
 
 #[derive(Debug)]
@@ -90,12 +113,14 @@ struct AppConfigValues {
     ffmpeg_bin: Option<String>,
     ffprobe_bin: Option<String>,
     yt_dlp_bin: Option<String>,
+    yt_dlp_js_runtime: Option<String>,
     whisper_bin: Option<String>,
     whisper_model: Option<PathBuf>,
     ollama_bin: Option<String>,
     ollama_model: Option<String>,
     cloud_ai_available: Option<String>,
     backend_base_url: Option<String>,
+    api_token: Option<String>,
 }
 
 impl AppConfig {
@@ -114,12 +139,14 @@ impl AppConfig {
             ffmpeg_bin: env::var("TV7_ENGINE_FFMPEG_BIN").ok(),
             ffprobe_bin: env::var("TV7_ENGINE_FFPROBE_BIN").ok(),
             yt_dlp_bin: env::var("TV7_ENGINE_YT_DLP_BIN").ok(),
+            yt_dlp_js_runtime: env::var("TV7_ENGINE_YT_DLP_JS_RUNTIME").ok(),
             whisper_bin: env::var("TV7_ENGINE_WHISPER_BIN").ok(),
             whisper_model: env::var("TV7_ENGINE_WHISPER_MODEL").ok().map(PathBuf::from),
             ollama_bin: env::var("TV7_ENGINE_OLLAMA_BIN").ok(),
             ollama_model: env::var("TV7_ENGINE_OLLAMA_MODEL").ok(),
             cloud_ai_available: env::var("TV7_ENGINE_CLOUD_AI_AVAILABLE").ok(),
             backend_base_url: env::var("TV7_ENGINE_BACKEND_BASE_URL").ok(),
+            api_token: env::var("TV7_ENGINE_API_TOKEN").ok(),
         })
     }
 
@@ -148,6 +175,7 @@ impl AppConfig {
         let ffmpeg_bin = values.ffmpeg_bin.unwrap_or_else(|| "ffmpeg".to_string());
         let ffprobe_bin = values.ffprobe_bin.unwrap_or_else(|| "ffprobe".to_string());
         let yt_dlp_bin = values.yt_dlp_bin.unwrap_or_else(|| "yt-dlp".to_string());
+        let yt_dlp_js_runtime = resolve_ytdlp_js_runtime(values.yt_dlp_js_runtime.as_deref())?;
         let ollama_bin = values.ollama_bin.unwrap_or_else(|| "ollama".to_string());
         let cloud_ai_available = values
             .cloud_ai_available
@@ -160,6 +188,13 @@ impl AppConfig {
             .backend_base_url
             .map(|value| value.trim_end_matches('/').to_string())
             .filter(|value| !value.is_empty());
+        if let Some(token) = values.api_token.as_deref() {
+            if !(32..=128).contains(&token.len())
+                || !token.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                anyhow::bail!("TV7_ENGINE_API_TOKEN must be 32..128 visible ASCII characters");
+            }
+        }
         let asset_dir = values
             .asset_dir
             .unwrap_or_else(|| values.work_dir.join(".tv7-engine-assets"));
@@ -203,12 +238,14 @@ impl AppConfig {
             ffmpeg_bin,
             ffprobe_bin,
             yt_dlp_bin,
+            yt_dlp_js_runtime,
             whisper_bin: values.whisper_bin,
             whisper_model: values.whisper_model,
             ollama_bin,
             ollama_model: values.ollama_model,
             cloud_ai_available,
             backend_base_url,
+            api_token: values.api_token.map(ApiToken),
         })
     }
 
@@ -245,6 +282,51 @@ struct RenderClipResponse {
 #[derive(Debug, Serialize)]
 struct JobCreateResponse {
     job: EngineJob,
+}
+
+#[derive(Debug, Deserialize)]
+struct SelectedVideo {
+    id: String,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SelectedIngestRequest {
+    videos: Vec<SelectedVideo>,
+    output_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UrlIngestHttpRequest {
+    url: String,
+    output_dir: Option<String>,
+    output_template: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SelectedJob {
+    video_id: String,
+    job_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SelectedIngestResponse {
+    jobs: Vec<SelectedJob>,
+}
+
+#[derive(Debug, Serialize)]
+struct FileIngestResponse {
+    media_id: String,
+    media_path: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct TranscriptImportResponse {
+    transcript_id: String,
+    transcript_path: String,
+    cue_count: usize,
+    duration_seconds: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -867,6 +949,58 @@ struct JobStore {
     jobs: Arc<Mutex<HashMap<String, EngineJob>>>,
 }
 
+#[derive(Clone, Default)]
+struct ExportStore {
+    assets: Arc<Mutex<HashMap<String, ExportAsset>>>,
+}
+
+#[derive(Clone)]
+struct ExportAsset {
+    path: PathBuf,
+    created: Instant,
+}
+
+const EXPORT_TTL: Duration = Duration::from_secs(60 * 60);
+const MAX_EXPORT_ASSETS: usize = 100;
+const MAX_EXPORT_BYTES: u64 = 1024 * 1024 * 1024;
+
+impl ExportStore {
+    fn register(&self, path: PathBuf) -> String {
+        let mut assets = self
+            .assets
+            .lock()
+            .expect("export store lock should not be poisoned");
+        assets.retain(|_, asset| asset.created.elapsed() < EXPORT_TTL);
+        if assets.len() >= MAX_EXPORT_ASSETS {
+            if let Some(oldest) = assets
+                .iter()
+                .min_by_key(|(_, asset)| asset.created)
+                .map(|(id, _)| id.clone())
+            {
+                assets.remove(&oldest);
+            }
+        }
+        let id = format!("render-{}", Uuid::new_v4());
+        assets.insert(
+            id.clone(),
+            ExportAsset {
+                path,
+                created: Instant::now(),
+            },
+        );
+        id
+    }
+
+    fn get(&self, id: &str) -> Option<PathBuf> {
+        let mut assets = self
+            .assets
+            .lock()
+            .expect("export store lock should not be poisoned");
+        assets.retain(|_, asset| asset.created.elapsed() < EXPORT_TTL);
+        assets.get(id).map(|asset| asset.path.clone())
+    }
+}
+
 const JOB_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_JOBS: usize = 1_000;
 
@@ -1094,7 +1228,64 @@ impl IntoResponse for ApiError {
     }
 }
 
+#[cfg(test)]
 fn build_router(state: AppState) -> Router {
+    build_router_with_auth(state, None)
+}
+
+#[derive(Clone)]
+struct EngineApiAuth {
+    token: Option<Arc<str>>,
+}
+
+fn constant_time_token_match(expected: &str, supplied: &str) -> bool {
+    let expected = expected.as_bytes();
+    let supplied = supplied.as_bytes();
+    let mut difference = expected.len() ^ supplied.len();
+    for index in 0..128 {
+        difference |=
+            usize::from(*expected.get(index).unwrap_or(&0) ^ *supplied.get(index).unwrap_or(&0));
+    }
+    difference == 0
+}
+
+async fn require_engine_api_token(
+    State(auth): State<EngineApiAuth>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let authorized = match auth.token.as_deref() {
+        None => true,
+        Some(_) if request.method() == Method::OPTIONS => true,
+        Some(expected) => request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|supplied| constant_time_token_match(expected, supplied)),
+    };
+    let mut response = if authorized {
+        next.run(request).await
+    } else {
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "ENGINE_AUTH_REQUIRED",
+            "Engine API token required",
+        )
+        .into_response()
+    };
+    response.headers_mut().insert(
+        "x-tv7-engine-auth-mode",
+        if auth.token.is_some() {
+            HeaderValue::from_static("token_required")
+        } else {
+            HeaderValue::from_static("development_unprotected")
+        },
+    );
+    response
+}
+
+fn build_router_with_auth(state: AppState, api_token: Option<String>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/diagnostics", get(diagnostics))
@@ -1112,12 +1303,44 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/media/probe", post(probe_media))
         .route("/v1/media/thumbnail", post(generate_thumbnail))
         .route("/v1/media/render-clip", post(render_clip))
+        .route("/v1/media/assets/:id", get(export_rendered_asset))
+        .route("/v1/transcripts/candidates", post(transcript_candidates))
+        .route(
+            "/v1/transcripts/import",
+            post(import_transcript).layer(DefaultBodyLimit::max(6 * 1024 * 1024)),
+        )
         .route("/v1/ingest/url", post(start_url_ingest))
+        .route("/v1/channels/discover", post(discover_channel))
+        .route("/v1/ingest/selected", post(start_selected_ingest))
+        .route(
+            "/v1/ingest/file",
+            post(ingest_file).layer(DefaultBodyLimit::max(1024 * 1024 * 1024 + 1024 * 1024)),
+        )
         .route("/v1/transcripts/download", post(start_transcript_download))
         .route("/v1/transcripts/generate", post(start_transcript_generate))
         .route("/v1/jobs/:id", get(get_job))
         .route("/v1/jobs/:id/logs", get(get_job_logs))
         .route("/v1/jobs/:id/cancel", post(cancel_job))
+        .layer(middleware::from_fn_with_state(
+            EngineApiAuth {
+                token: api_token.map(Arc::from),
+            },
+            require_engine_api_token,
+        ))
+        .layer(
+            CorsLayer::new()
+                .allow_origin([
+                    HeaderValue::from_static("http://127.0.0.1:8080"),
+                    HeaderValue::from_static("http://localhost:8080"),
+                    HeaderValue::from_static("http://127.0.0.1:5173"),
+                    HeaderValue::from_static("http://localhost:5173"),
+                    HeaderValue::from_static("tauri://localhost"),
+                    HeaderValue::from_static("http://tauri.localhost"),
+                ])
+                .allow_methods([Method::GET, Method::POST, Method::DELETE])
+                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+                .expose_headers([header::HeaderName::from_static("x-tv7-engine-auth-mode")]),
+        )
         .with_state(state)
 }
 
@@ -1323,41 +1546,727 @@ async fn generate_thumbnail(
 
 async fn render_clip(
     State(state): State<AppState>,
-    Json(payload): Json<RenderClipRequest>,
+    Json(mut payload): Json<RenderClipRequest>,
 ) -> Result<Json<RenderClipResponse>, ApiError> {
-    let result = state
+    if let Some(path) = payload.subtitle_path.as_deref() {
+        payload.subtitle_path = Some(
+            validate_engine_asset_file(&state, path)?
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
+    let mut result = state
         .clip_renderer
         .render_clip(&payload)
         .map_err(ApiError::from)?;
+    if let Some(path) = owned_mp4_path(&state, &result.output_path) {
+        if let Ok(metadata) = fs::metadata(&path) {
+            if (1..=MAX_EXPORT_BYTES).contains(&metadata.len()) {
+                result.media_id = Some(state.exports.register(path));
+            }
+        }
+    }
 
     Ok(Json(RenderClipResponse { result }))
 }
 
+fn owned_mp4_path(state: &AppState, path: &str) -> Option<PathBuf> {
+    let root = fs::canonicalize(&state.setup_context.asset_dir).ok()?;
+    let file = fs::canonicalize(path).ok()?;
+    if !file.starts_with(root)
+        || !file.is_file()
+        || file
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_none_or(|ext| !ext.eq_ignore_ascii_case("mp4"))
+    {
+        return None;
+    }
+    Some(file)
+}
+
+fn parse_byte_range(value: &str, size: u64) -> Option<(u64, u64)> {
+    let value = value.strip_prefix("bytes=")?;
+    if value.contains(',') || size == 0 {
+        return None;
+    }
+    let (start, end) = value.split_once('-')?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        return Some((size.saturating_sub(suffix), size - 1));
+    }
+    let start = start.parse::<u64>().ok()?;
+    if start >= size {
+        return None;
+    }
+    let end = if end.is_empty() {
+        size - 1
+    } else {
+        end.parse::<u64>().ok()?.min(size - 1)
+    };
+    (end >= start).then_some((start, end))
+}
+
+async fn export_rendered_asset(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, ApiError> {
+    let registered = state.exports.get(&id).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "ASSET_NOT_FOUND",
+            "rendered asset not found",
+        )
+    })?;
+    let path = owned_mp4_path(&state, &registered.to_string_lossy()).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "ASSET_NOT_FOUND",
+            "rendered asset not found",
+        )
+    })?;
+    let size = tokio::fs::metadata(&path)
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "ASSET_NOT_FOUND",
+                "rendered asset not found",
+            )
+        })?
+        .len();
+    if size == 0 {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "ASSET_NOT_FOUND",
+            "rendered asset not found",
+        ));
+    }
+    if size > MAX_EXPORT_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "ASSET_TOO_LARGE",
+            "rendered asset exceeds export size limit",
+        ));
+    }
+    let range = headers.get(header::RANGE).map(|value| {
+        value
+            .to_str()
+            .ok()
+            .and_then(|value| parse_byte_range(value, size))
+    });
+    if matches!(range, Some(None)) {
+        return Ok(Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{size}"))
+            .body(Body::empty())
+            .expect("valid range response"));
+    }
+    let (start, end) = range.flatten().unwrap_or((0, size - 1));
+    let mut file = tokio::fs::File::open(&path).await.map_err(|_| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "ASSET_NOT_FOUND",
+            "rendered asset not found",
+        )
+    })?;
+    file.seek(std::io::SeekFrom::Start(start))
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ASSET_READ_ERROR",
+                error.to_string(),
+            )
+        })?;
+    let length = end - start + 1;
+    let stream = ReaderStream::new(file.take(length));
+    let mut response = Response::builder()
+        .status(if range.is_some() {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
+        .header(header::CONTENT_TYPE, "video/mp4")
+        .header(header::CONTENT_LENGTH, length.to_string())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"tv7-clip.mp4\"",
+        );
+    if range.is_some() {
+        response = response.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
+    }
+    Ok(response
+        .body(Body::from_stream(stream))
+        .expect("valid asset response"))
+}
+
+async fn transcript_candidates(
+    State(state): State<AppState>,
+    Json(mut payload): Json<CandidateRequest>,
+) -> Result<Json<CandidateResponse>, ApiError> {
+    payload.transcript_path = validate_engine_asset_file(&state, &payload.transcript_path)?
+        .to_string_lossy()
+        .to_string();
+    let response = tokio::task::spawn_blocking(move || generate_candidates(&payload))
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CANDIDATE_GENERATION_FAILED",
+                error.to_string(),
+            )
+        })??;
+    Ok(Json(response))
+}
+
+fn validate_engine_asset_file(state: &AppState, path: &str) -> Result<PathBuf, ApiError> {
+    let root = fs::canonicalize(&state.setup_context.asset_dir).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_TRANSCRIPT_PATH",
+            "Engine asset directory unavailable",
+        )
+    })?;
+    let candidate = fs::canonicalize(path).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_TRANSCRIPT_PATH",
+            "transcript file does not exist",
+        )
+    })?;
+    if !candidate.starts_with(root)
+        || !candidate.is_file()
+        || candidate.extension().and_then(|value| value.to_str()) != Some("vtt")
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_TRANSCRIPT_PATH",
+            "VTT must be inside Engine asset directory",
+        ));
+    }
+    Ok(candidate)
+}
+
 async fn start_url_ingest(
     State(state): State<AppState>,
-    Json(payload): Json<UrlIngestRequest>,
+    Json(payload): Json<UrlIngestHttpRequest>,
 ) -> Result<(StatusCode, Json<JobCreateResponse>), ApiError> {
+    let output_dir = resolve_ingest_output_dir(&state, payload.output_dir)?;
+    let job = spawn_url_ingest(
+        &state,
+        UrlIngestRequest {
+            url: payload.url,
+            output_dir: output_dir.to_string_lossy().to_string(),
+            output_template: payload.output_template,
+        },
+    );
+    Ok((StatusCode::ACCEPTED, Json(JobCreateResponse { job })))
+}
+
+async fn discover_channel(
+    State(state): State<AppState>,
+    Json(payload): Json<ChannelDiscoverRequest>,
+) -> Result<Json<ChannelPage>, ApiError> {
+    let ingestor = state.url_ingestor.clone();
+    let page = tokio::task::spawn_blocking(move || ingestor.discover_channel(&payload))
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DISCOVERY_FAILED",
+                error.to_string(),
+            )
+        })??;
+    Ok(Json(page))
+}
+
+async fn start_selected_ingest(
+    State(state): State<AppState>,
+    Json(payload): Json<SelectedIngestRequest>,
+) -> Result<(StatusCode, Json<SelectedIngestResponse>), ApiError> {
+    if payload.videos.is_empty() || payload.videos.len() > 25 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_SELECTION",
+            "select 1 to 25 videos",
+        ));
+    }
+    let output_dir = resolve_ingest_output_dir(&state, payload.output_dir)?;
+    let mut seen = std::collections::HashSet::new();
+    for video in &payload.videos {
+        if !valid_youtube_video_id(&video.id)
+            || video.url != format!("https://www.youtube.com/watch?v={}", video.id)
+            || !seen.insert(&video.id)
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_SELECTION",
+                "selection must contain unique discovered YouTube video IDs and URLs",
+            ));
+        }
+    }
+    let jobs = payload
+        .videos
+        .into_iter()
+        .map(|video| {
+            let job = spawn_url_ingest(
+                &state,
+                UrlIngestRequest {
+                    url: video.url,
+                    output_dir: output_dir.to_string_lossy().to_string(),
+                    output_template: Some(format!("{}-%(title).160B.%(ext)s", video.id)),
+                },
+            );
+            SelectedJob {
+                video_id: video.id,
+                job_id: job.id,
+            }
+        })
+        .collect();
+    Ok((StatusCode::ACCEPTED, Json(SelectedIngestResponse { jobs })))
+}
+
+fn resolve_ingest_output_dir(
+    state: &AppState,
+    requested: Option<String>,
+) -> Result<PathBuf, ApiError> {
+    let asset_dir = &state.setup_context.asset_dir;
+    fs::create_dir_all(asset_dir).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ASSET_DIR_UNAVAILABLE",
+            error.to_string(),
+        )
+    })?;
+    let asset_root = fs::canonicalize(asset_dir).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ASSET_DIR_UNAVAILABLE",
+            error.to_string(),
+        )
+    })?;
+    let output_dir = match requested {
+        Some(dir) => fs::canonicalize(&dir).map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_OUTPUT_DIR",
+                "output directory does not exist",
+            )
+        })?,
+        None => asset_root.clone(),
+    };
+    if !output_dir.starts_with(&asset_root) || !output_dir.is_dir() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_OUTPUT_DIR",
+            "output directory must be inside Engine asset directory",
+        ));
+    }
+    Ok(output_dir)
+}
+
+const MAX_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+
+struct PartialUploadGuard(Option<PathBuf>);
+
+impl Drop for PartialUploadGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn checked_upload_size(current: u64, chunk_size: usize, limit: u64) -> Result<u64, ApiError> {
+    let size = current.checked_add(chunk_size as u64).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "UPLOAD_TOO_LARGE",
+            "file exceeds size limit",
+        )
+    })?;
+    if size > limit {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "UPLOAD_TOO_LARGE",
+            "file exceeds size limit",
+        ));
+    }
+    Ok(size)
+}
+
+async fn ingest_file(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<FileIngestResponse>), ApiError> {
+    let mut field = multipart
+        .next_field()
+        .await
+        .map_err(|error| {
+            ApiError::new(StatusCode::BAD_REQUEST, "INVALID_UPLOAD", error.to_string())
+        })?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_UPLOAD",
+                "missing file field",
+            )
+        })?;
+    if field.name() != Some("file") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_UPLOAD",
+            "expected file field",
+        ));
+    }
+    let ext = Path::new(field.file_name().unwrap_or(""))
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(
+        ext.as_str(),
+        "mp4" | "mov" | "mkv" | "webm" | "m4v" | "mp3" | "wav" | "m4a"
+    ) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_UPLOAD",
+            "unsupported media filename extension",
+        ));
+    }
+    let asset_dir = &state.setup_context.asset_dir;
+    tokio::fs::create_dir_all(asset_dir)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ASSET_DIR_UNAVAILABLE",
+                error.to_string(),
+            )
+        })?;
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let partial = asset_dir.join(format!("upload-{nonce}.partial"));
+    let final_path = asset_dir.join(format!("upload-{nonce}.{ext}"));
+    let mut partial_guard = PartialUploadGuard(Some(partial.clone()));
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&partial)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UPLOAD_IO_ERROR",
+                error.to_string(),
+            )
+        })?;
+    let result = async {
+        let mut size = 0u64;
+        while let Some(chunk) = field.chunk().await.map_err(|error| {
+            ApiError::new(StatusCode::BAD_REQUEST, "INVALID_UPLOAD", error.to_string())
+        })? {
+            size = checked_upload_size(size, chunk.len(), MAX_UPLOAD_BYTES)?;
+            file.write_all(&chunk).await.map_err(|error| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "UPLOAD_IO_ERROR",
+                    error.to_string(),
+                )
+            })?;
+        }
+        drop(field);
+        if size == 0 {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_UPLOAD",
+                "empty file",
+            ));
+        }
+        file.sync_all().await.map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UPLOAD_IO_ERROR",
+                error.to_string(),
+            )
+        })?;
+        drop(file);
+        Ok(size)
+    }
+    .await;
+    match result {
+        Ok(size_bytes) => {
+            let extra = multipart.next_field().await.map_err(|error| {
+                ApiError::new(StatusCode::BAD_REQUEST, "INVALID_UPLOAD", error.to_string())
+            });
+            if !matches!(extra, Ok(None)) {
+                let _ = tokio::fs::remove_file(&partial).await;
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_UPLOAD",
+                    "expected exactly one file field",
+                ));
+            }
+            tokio::fs::rename(&partial, &final_path)
+                .await
+                .map_err(|error| {
+                    ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "UPLOAD_IO_ERROR",
+                        error.to_string(),
+                    )
+                })?;
+            partial_guard.0 = None;
+            Ok((
+                StatusCode::CREATED,
+                Json(FileIngestResponse {
+                    media_id: format!("upload-{nonce}"),
+                    media_path: final_path.to_string_lossy().to_string(),
+                    size_bytes,
+                }),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn import_transcript(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<TranscriptImportResponse>), ApiError> {
+    const MAX_VTT_BYTES: u64 = 5 * 1024 * 1024;
+    let mut field = multipart
+        .next_field()
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_TRANSCRIPT",
+                error.to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_TRANSCRIPT",
+                "missing file field",
+            )
+        })?;
+    if field.name() != Some("file")
+        || Path::new(field.file_name().unwrap_or(""))
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.eq_ignore_ascii_case("vtt"))
+            != Some(true)
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_TRANSCRIPT",
+            "expected one .vtt file field",
+        ));
+    }
+    let asset_dir = &state.setup_context.asset_dir;
+    tokio::fs::create_dir_all(asset_dir)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ASSET_DIR_UNAVAILABLE",
+                error.to_string(),
+            )
+        })?;
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let transcript_id = format!("transcript-{nonce}");
+    let partial = asset_dir.join(format!("{transcript_id}.partial"));
+    let final_path = asset_dir.join(format!("{transcript_id}.vtt"));
+    let mut partial_guard = PartialUploadGuard(Some(partial.clone()));
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&partial)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UPLOAD_IO_ERROR",
+                error.to_string(),
+            )
+        })?;
+    let result = async {
+        let mut size = 0u64;
+        while let Some(chunk) = field.chunk().await.map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_TRANSCRIPT",
+                error.to_string(),
+            )
+        })? {
+            size = checked_upload_size(size, chunk.len(), MAX_VTT_BYTES)?;
+            file.write_all(&chunk).await.map_err(|error| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "UPLOAD_IO_ERROR",
+                    error.to_string(),
+                )
+            })?;
+        }
+        drop(field);
+        if size == 0 {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_TRANSCRIPT",
+                "empty VTT",
+            ));
+        }
+        file.sync_all().await.map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UPLOAD_IO_ERROR",
+                error.to_string(),
+            )
+        })?;
+        drop(file);
+        Ok(())
+    }
+    .await;
+    result?;
+    if multipart
+        .next_field()
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_TRANSCRIPT",
+                error.to_string(),
+            )
+        })?
+        .is_some()
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_TRANSCRIPT",
+            "expected exactly one file field",
+        ));
+    }
+    let metadata = tokio::task::spawn_blocking({
+        let partial = partial.clone();
+        move || inspect_vtt(&partial)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "TRANSCRIPT_VALIDATION_FAILED",
+            error.to_string(),
+        )
+    })?
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_TRANSCRIPT",
+            error.to_string(),
+        )
+    })?;
+    tokio::fs::rename(&partial, &final_path)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UPLOAD_IO_ERROR",
+                error.to_string(),
+            )
+        })?;
+    partial_guard.0 = None;
+    Ok((
+        StatusCode::CREATED,
+        Json(TranscriptImportResponse {
+            transcript_id,
+            transcript_path: final_path.to_string_lossy().to_string(),
+            cue_count: metadata.cue_count,
+            duration_seconds: metadata.duration_seconds,
+        }),
+    ))
+}
+
+fn spawn_url_ingest(state: &AppState, mut payload: UrlIngestRequest) -> EngineJob {
     let job = state.jobs.create(JobKind::UrlIngest);
     let job_id = job.id.clone();
+    if let Some(template) = payload.output_template.as_mut() {
+        *template = format!("{job_id}-{template}");
+    }
+    let output_dir = payload.output_dir.clone();
     let jobs = state.jobs.clone();
     let ingestor = state.url_ingestor.clone();
     let task_jobs = jobs.clone();
-    spawn_blocking_job(jobs, job_id.clone(), move || {
+    tokio::spawn(async move {
+        let Ok(_permit) = download_semaphore().acquire_owned().await else {
+            return;
+        };
         if task_jobs.is_cancel_requested(&job_id) {
             return;
         }
-        task_jobs.update(&job_id, |job| {
-            job.status = JobStatus::Running;
-            job.progress = 0.1;
-            job.logs.push("started url ingest".to_string());
+        let task = spawn_blocking_job(jobs, job_id.clone(), move || {
+            if task_jobs.is_cancel_requested(&job_id) {
+                return;
+            }
+            task_jobs.update(&job_id, |job| {
+                job.status = JobStatus::Running;
+                job.progress = 0.1;
+                job.logs.push("started url ingest".to_string());
+            });
+            match ingestor
+                .ingest_url_cancelable(&payload, &|| task_jobs.is_cancel_requested(&job_id))
+            {
+                Ok(result) => complete_job(&task_jobs, &job_id, result),
+                Err(error) => {
+                    if task_jobs.is_cancel_requested(&job_id) && payload.output_template.is_some() {
+                        if let Ok(entries) = fs::read_dir(&output_dir) {
+                            for entry in entries.flatten() {
+                                if entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .starts_with(&format!("{job_id}-"))
+                                    && entry.path().is_file()
+                                {
+                                    let _ = fs::remove_file(entry.path());
+                                }
+                            }
+                        }
+                    }
+                    fail_job(&task_jobs, &job_id, error)
+                }
+            }
         });
-        match ingestor.ingest_url(&payload) {
-            Ok(result) => complete_job(&task_jobs, &job_id, result),
-            Err(error) => fail_job(&task_jobs, &job_id, error),
-        }
+        let _ = task.await;
     });
 
-    Ok((StatusCode::ACCEPTED, Json(JobCreateResponse { job })))
+    job
+}
+
+fn download_semaphore() -> Arc<Semaphore> {
+    static DOWNLOAD_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    DOWNLOAD_SLOTS
+        .get_or_init(|| Arc::new(Semaphore::new(3)))
+        .clone()
 }
 
 async fn start_transcript_download(
@@ -1481,12 +2390,16 @@ async fn cancel_job(
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "JOB_NOT_FOUND", "job not found"))
 }
 
-fn spawn_blocking_job(job_store: JobStore, job_id: String, run: impl FnOnce() + Send + 'static) {
+fn spawn_blocking_job(
+    job_store: JobStore,
+    job_id: String,
+    run: impl FnOnce() + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(run)) {
             fail_job_panic(&job_store, &job_id, panic_payload_message(payload));
         }
-    });
+    })
 }
 
 fn complete_job<T>(jobs: &JobStore, job_id: &str, result: T)
@@ -1565,14 +2478,20 @@ fn fail_job(jobs: &JobStore, job_id: &str, error: EngineError) {
 async fn main() -> Result<()> {
     let config = AppConfig::from_env()?;
     initialize_logging(&config.log_level);
+    if config.api_token.is_none() {
+        warn!("Engine API token is not configured; development loopback mode is unprotected");
+    }
 
-    let media_engine = Arc::new(FfmpegMediaEngine::with_all_bins_and_transcription(
-        config.ffmpeg_bin.clone(),
-        config.ffprobe_bin.clone(),
-        config.yt_dlp_bin.clone(),
-        config.whisper_bin.clone(),
-        config.whisper_model.clone(),
-    ));
+    let media_engine = Arc::new(
+        FfmpegMediaEngine::with_all_bins_and_transcription(
+            config.ffmpeg_bin.clone(),
+            config.ffprobe_bin.clone(),
+            config.yt_dlp_bin.clone(),
+            config.whisper_bin.clone(),
+            config.whisper_model.clone(),
+        )
+        .with_ytdlp_js_runtime(config.yt_dlp_js_runtime.clone()),
+    );
     let state = AppState {
         media_probe: media_engine.clone(),
         thumbnail_generator: media_engine.clone(),
@@ -1582,6 +2501,7 @@ async fn main() -> Result<()> {
         diagnostics_provider: media_engine.clone(),
         setup_provider: media_engine,
         jobs: JobStore::default(),
+        exports: ExportStore::default(),
         diagnostics_context: DiagnosticsContext::new(
             env!("CARGO_PKG_VERSION"),
             config.host.to_string(),
@@ -1600,7 +2520,10 @@ async fn main() -> Result<()> {
         cloud_ai_tokens: CloudAiTokenStore::default(),
         cloud_ai_executor: Arc::new(BackendCloudAiClient::new(config.backend_base_url.clone())),
     };
-    let app = build_router(state);
+    let app = build_router_with_auth(
+        state,
+        config.api_token.as_ref().map(|token| token.0.clone()),
+    );
     let listener = tokio::net::TcpListener::bind(config.socket_addr())
         .await
         .with_context(|| format!("failed to bind on {}", config.socket_addr()))?;
@@ -1625,6 +2548,59 @@ fn parse_bool(value: &str) -> Result<bool> {
         "1" | "true" | "TRUE" | "True" => Ok(true),
         "0" | "false" | "FALSE" | "False" => Ok(false),
         _ => anyhow::bail!("expected true or false, got {value}"),
+    }
+}
+
+fn resolve_ytdlp_js_runtime(configured: Option<&str>) -> Result<Option<String>> {
+    if let Some(value) = configured {
+        if value == "none" {
+            return Ok(None);
+        }
+        let (name, executable) = match value.split_once(':') {
+            Some((name, path)) if Path::new(path).is_absolute() => (name, path),
+            Some(_) => anyhow::bail!("TV7_ENGINE_YT_DLP_JS_RUNTIME path must be absolute"),
+            None => (value, value),
+        };
+        if !matches!(name, "node" | "deno") {
+            anyhow::bail!(
+                "TV7_ENGINE_YT_DLP_JS_RUNTIME must be node, deno, node:/absolute/path, deno:/absolute/path, or none"
+            );
+        }
+        if !supported_js_runtime(name, executable) {
+            anyhow::bail!(
+                "configured {name} JavaScript runtime is unavailable or below yt-dlp's supported minimum"
+            );
+        }
+        return Ok(Some(value.to_string()));
+    }
+    for name in ["deno", "node"] {
+        if supported_js_runtime(name, name) {
+            return Ok(Some(name.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn supported_js_runtime(name: &str, executable: &str) -> bool {
+    let output = match Command::new(executable).arg("--version").output() {
+        Ok(output) if output.status.success() => output,
+        _ => return false,
+    };
+    let version = String::from_utf8_lossy(&output.stdout);
+    let token = version
+        .split_whitespace()
+        .find(|part| part.chars().any(|c| c.is_ascii_digit()))
+        .unwrap_or("");
+    let version = token.trim_start_matches('v');
+    let mut numbers = version
+        .split('.')
+        .filter_map(|part| part.parse::<u32>().ok());
+    let major = numbers.next().unwrap_or(0);
+    let minor = numbers.next().unwrap_or(0);
+    match name {
+        "node" => major >= 22,
+        "deno" => major > 2 || (major == 2 && minor >= 3),
+        _ => false,
     }
 }
 
@@ -1720,6 +2696,23 @@ mod tests {
     }
 
     impl UrlIngestor for MockMediaProbe {
+        fn discover_channel(
+            &self,
+            request: &ChannelDiscoverRequest,
+        ) -> Result<ChannelPage, EngineError> {
+            Ok(ChannelPage {
+                channel_url: request.url.clone(),
+                videos: vec![engine_core::ChannelVideo {
+                    id: "abcdefghijk".into(),
+                    url: "https://www.youtube.com/watch?v=abcdefghijk".into(),
+                    title: "Test video".into(),
+                    duration_seconds: Some(42.0),
+                    thumbnail_url: None,
+                }],
+                next_cursor: None,
+            })
+        }
+
         fn ingest_url(&self, request: &UrlIngestRequest) -> Result<UrlIngestResult, EngineError> {
             Ok(UrlIngestResult {
                 url: request.url.clone(),
@@ -1939,6 +2932,13 @@ mod tests {
         response: Result<MediaMetadata, EngineError>,
         setup_context: SetupContext,
     ) -> Router {
+        build_router(mock_app_state(response, setup_context))
+    }
+
+    fn mock_app_state(
+        response: Result<MediaMetadata, EngineError>,
+        setup_context: SetupContext,
+    ) -> AppState {
         let mock = Arc::new(MockMediaProbe {
             probe_response: response,
             thumbnail_response: Ok(ThumbnailResult {
@@ -1947,9 +2947,10 @@ mod tests {
             render_response: Ok(RenderClipResult {
                 output_path: "/tmp/clip.mp4".to_string(),
                 duration_seconds: 10.0,
+                media_id: None,
             }),
         });
-        build_router(AppState {
+        AppState {
             media_probe: mock.clone(),
             thumbnail_generator: mock.clone(),
             clip_renderer: mock.clone(),
@@ -1958,6 +2959,7 @@ mod tests {
             diagnostics_provider: mock.clone(),
             setup_provider: mock,
             jobs: JobStore::default(),
+            exports: ExportStore::default(),
             diagnostics_context: DiagnosticsContext::new(
                 env!("CARGO_PKG_VERSION"),
                 "127.0.0.1",
@@ -1967,7 +2969,7 @@ mod tests {
             setup_context,
             cloud_ai_tokens: CloudAiTokenStore::default(),
             cloud_ai_executor: Arc::new(RecordingCloudAiExecutor::default()),
-        })
+        }
     }
 
     fn engine_openapi() -> serde_json::Value {
@@ -1975,6 +2977,66 @@ mod tests {
             "../../docs/core/contracts/openapi/tv7-engine/openapi.json"
         ))
         .expect("engine openapi contract should be valid json")
+    }
+
+    #[tokio::test]
+    async fn browser_cors_allows_only_local_studio_origins() {
+        for origin in [
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://127.0.0.1:5173",
+            "http://localhost:5173",
+            "tauri://localhost",
+            "http://tauri.localhost",
+        ] {
+            let request = Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/v1/media/probe")
+                .header(header::ORIGIN, origin)
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+                .body(Body::empty())
+                .unwrap();
+            let response = router_with_probe(Err(EngineError::Io("unused".into())))
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .unwrap(),
+                origin
+            );
+            assert!(
+                response
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_METHODS)
+            );
+            assert!(
+                response
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            );
+        }
+
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/v1/media/probe")
+            .header(header::ORIGIN, "https://untrusted.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .body(Body::empty())
+            .unwrap();
+        let response = router_with_probe(Err(EngineError::Io("unused".into())))
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert!(
+            !response
+                .headers()
+                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        );
     }
 
     fn success_statuses_for(
@@ -2028,6 +3090,233 @@ mod tests {
         )
     }
 
+    #[test]
+    fn upload_size_limit_rejects_oversize_and_overflow() {
+        assert_eq!(checked_upload_size(3, 2, 5).unwrap(), 5);
+        assert_eq!(
+            checked_upload_size(3, 3, 5).unwrap_err().status,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            checked_upload_size(u64::MAX, 1, u64::MAX)
+                .unwrap_err()
+                .status,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_ingest_requires_explicit_valid_selection() {
+        let app = router_with_probe(Err(EngineError::Io("unused".into())));
+        for body in [
+            r#"{"videos":[]}"#,
+            r#"{"videos":[{"id":"abcdefghijk","url":"https://evil.example/watch?v=abcdefghijk"}]}"#,
+            r#"{"videos":[{"id":"abcdefghijk","url":"https://www.youtube.com/watch?v=abcdefghijk"},{"id":"abcdefghijk","url":"https://www.youtube.com/watch?v=abcdefghijk"}]}"#,
+        ] {
+            let (status, _) =
+                request_json(app.clone(), "POST", "/v1/ingest/selected", Some(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        let oversized = serde_json::json!({"videos": (0..26).map(|_| serde_json::json!({"id":"abcdefghijk","url":"https://www.youtube.com/watch?v=abcdefghijk"})).collect::<Vec<_>>()});
+        let (status, _) = request_json(
+            app,
+            "POST",
+            "/v1/ingest/selected",
+            Some(&oversized.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn selected_ingest_creates_one_job_per_explicit_video() {
+        let app = router_with_probe(Err(EngineError::Io("unused".into())));
+        let (status, body) = request_json(app, "POST", "/v1/ingest/selected", Some(r#"{"videos":[{"id":"abcdefghijk","url":"https://www.youtube.com/watch?v=abcdefghijk"},{"id":"lmnopqrstuv","url":"https://www.youtube.com/watch?v=lmnopqrstuv"}]}"#)).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let jobs = body["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0]["video_id"], "abcdefghijk");
+        assert_eq!(jobs[1]["video_id"], "lmnopqrstuv");
+        assert_ne!(jobs[0]["job_id"], jobs[1]["job_id"]);
+    }
+
+    #[tokio::test]
+    async fn candidate_and_subtitle_routes_restrict_vtt_to_engine_assets() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let asset_dir = std::env::temp_dir().join(format!("tv7-candidate-test-{unique}"));
+        fs::create_dir_all(&asset_dir).unwrap();
+        let inside = asset_dir.join("in.vtt");
+        let outside = std::env::temp_dir().join(format!("tv7-candidate-outside-{unique}.vtt"));
+        fs::write(
+            &inside,
+            "WEBVTT\n\n00:00:00.000 --> 00:00:20.000\nUseful excerpt\n",
+        )
+        .unwrap();
+        fs::write(
+            &outside,
+            "WEBVTT\n\n00:00:00.000 --> 00:00:20.000\nOutside\n",
+        )
+        .unwrap();
+        let mut context = test_setup_context();
+        context.asset_dir = asset_dir.clone();
+        let app =
+            router_with_probe_and_setup_context(Err(EngineError::Io("unused".into())), context);
+        let inside_body = serde_json::json!({"transcript_path":inside});
+        let (status, response) = request_json(
+            app.clone(),
+            "POST",
+            "/v1/transcripts/candidates",
+            Some(&inside_body.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["candidates"].as_array().unwrap().len(), 1);
+        let outside_body = serde_json::json!({"transcript_path":outside});
+        let (status, _) = request_json(
+            app.clone(),
+            "POST",
+            "/v1/transcripts/candidates",
+            Some(&outside_body.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let render_body = serde_json::json!({"source_path":"/tmp/source.mp4","output_path":"/tmp/clip.mp4","start_seconds":0.0,"end_seconds":1.0,"subtitle_path":outside});
+        let (status, _) = request_json(
+            app,
+            "POST",
+            "/v1/media/render-clip",
+            Some(&render_body.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let _ = fs::remove_file(outside);
+        let _ = fs::remove_dir_all(asset_dir);
+    }
+
+    #[tokio::test]
+    async fn url_job_stays_queued_until_slot_available_and_can_be_cancelled() {
+        let slots = download_semaphore();
+        let held = slots.clone().acquire_many_owned(3).await.unwrap();
+        let state = mock_app_state(Err(EngineError::Io("unused".into())), test_setup_context());
+        let job = spawn_url_ingest(
+            &state,
+            UrlIngestRequest {
+                url: "https://www.youtube.com/watch?v=abcdefghijk".into(),
+                output_dir: std::env::temp_dir().to_string_lossy().to_string(),
+                output_template: Some("test-%(ext)s".into()),
+            },
+        );
+        tokio::task::yield_now().await;
+        let queued = state.jobs.get(&job.id).unwrap();
+        assert!(matches!(queued.status, JobStatus::Queued));
+        state.jobs.cancel(&job.id);
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let cancelled = state.jobs.get(&job.id).unwrap();
+        assert!(matches!(cancelled.status, JobStatus::Cancelled));
+        assert!(cancelled.result.is_none());
+    }
+
+    #[tokio::test]
+    async fn multipart_upload_ignores_unsafe_client_filename() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let asset_dir = std::env::temp_dir().join(format!("tv7-upload-test-{unique}"));
+        let mut context = test_setup_context();
+        context.asset_dir = asset_dir.clone();
+        let app =
+            router_with_probe_and_setup_context(Err(EngineError::Io("unused".into())), context);
+        let body = b"--tv7\r\nContent-Disposition: form-data; name=\"file\"; filename=\"../../unsafe.mp4\"\r\nContent-Type: video/mp4\r\n\r\nabc\r\n--tv7--\r\n";
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/ingest/file")
+                    .header("content-type", "multipart/form-data; boundary=tv7")
+                    .body(Body::from(body.to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(
+            success_statuses_for(&engine_openapi(), "/v1/ingest/file", "post")
+                .contains(&response.status().as_u16())
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let media_path = PathBuf::from(value["media_path"].as_str().unwrap());
+        assert!(media_path.starts_with(&asset_dir));
+        assert_eq!(fs::read(&media_path).unwrap(), b"abc");
+        assert_eq!(value["size_bytes"], 3);
+        let _ = fs::remove_dir_all(asset_dir);
+    }
+
+    #[tokio::test]
+    async fn transcript_import_validates_and_atomically_stores_bounded_vtt() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let asset_dir = std::env::temp_dir().join(format!("tv7-vtt-import-test-{unique}"));
+        let mut context = test_setup_context();
+        context.asset_dir = asset_dir.clone();
+        let app =
+            router_with_probe_and_setup_context(Err(EngineError::Io("unused".into())), context);
+        let multipart_body = |contents: &[u8]| {
+            let mut body = b"--tv7\r\nContent-Disposition: form-data; name=\"file\"; filename=\"../../transcript.vtt\"\r\nContent-Type: text/vtt\r\n\r\n".to_vec();
+            body.extend_from_slice(contents);
+            body.extend_from_slice(b"\r\n--tv7--\r\n");
+            body
+        };
+        let request = |body: Vec<u8>| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/transcripts/import")
+                .header("content-type", "multipart/form-data; boundary=tv7")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let good = b"WEBVTT\n\n00:00:00.000 --> 00:00:01.500\nUseful line\n";
+        let response = app
+            .clone()
+            .oneshot(request(multipart_body(good)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let path = PathBuf::from(body["transcript_path"].as_str().unwrap());
+        assert!(path.starts_with(&asset_dir));
+        assert_eq!(body["cue_count"], 1);
+        assert_eq!(body["duration_seconds"], 1.5);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            String::from_utf8_lossy(good)
+        );
+        let bad = app
+            .clone()
+            .oneshot(request(multipart_body(b"not a VTT")))
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let oversized = app
+            .oneshot(request(multipart_body(&vec![b'x'; 5 * 1024 * 1024 + 1])))
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let entries = fs::read_dir(&asset_dir).unwrap().count();
+        assert_eq!(entries, 1, "rejected imports must not leave partial files");
+        let _ = fs::remove_dir_all(asset_dir);
+    }
+
     fn ready_transcription_setup_context() -> SetupContext {
         SetupContext::new(
             "test-platform",
@@ -2050,13 +3339,279 @@ mod tests {
             ffmpeg_bin: None,
             ffprobe_bin: None,
             yt_dlp_bin: None,
+            yt_dlp_js_runtime: None,
             whisper_bin: None,
             whisper_model: None,
             ollama_bin: None,
             ollama_model: None,
             cloud_ai_available: None,
             backend_base_url: None,
+            api_token: None,
         }
+    }
+
+    #[tokio::test]
+    async fn configured_api_token_protects_health_and_mutations() {
+        let token = "a".repeat(48);
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let asset_dir = std::env::temp_dir().join(format!("tv7-auth-test-{unique}"));
+        let mut context = test_setup_context();
+        context.asset_dir = asset_dir.clone();
+        let app = build_router_with_auth(
+            mock_app_state(Err(EngineError::Io("unused".into())), context),
+            Some(token.clone()),
+        );
+        for authorization in [None, Some("Bearer wrong".to_string())] {
+            let mut request = Request::builder().method("GET").uri("/health");
+            if let Some(value) = authorization {
+                request = request.header(header::AUTHORIZATION, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"], "ENGINE_AUTH_REQUIRED");
+            assert!(!body.to_string().contains(&token));
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-tv7-engine-auth-mode"],
+            "token_required"
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/ingest/file")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            !asset_dir.exists(),
+            "unauthorized mutation must not create asset directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_preflight_allows_authorization_header_and_dev_mode_is_labeled() {
+        let app = build_router_with_auth(
+            mock_app_state(Err(EngineError::Io("unused".into())), test_setup_context()),
+            Some("b".repeat(48)),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/ingest/file")
+                    .header(header::ORIGIN, "http://localhost:5173")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .header(
+                        header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "authorization,content-type",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "http://localhost:5173"
+        );
+        assert!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+                .to_str()
+                .unwrap()
+                .contains("authorization")
+        );
+        let dev = router_with_probe(Err(EngineError::Io("unused".into())));
+        let response = dev
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-tv7-engine-auth-mode"],
+            "development_unprotected"
+        );
+    }
+
+    #[test]
+    fn api_token_configuration_rejects_weak_values() {
+        let mut values = test_config_values(std::env::temp_dir());
+        values.api_token = Some("short".to_string());
+        assert!(AppConfig::from_values(values).is_err());
+        assert!(constant_time_token_match(&"a".repeat(48), &"a".repeat(48)));
+        assert!(!constant_time_token_match(&"a".repeat(48), &"b".repeat(48)));
+    }
+
+    #[tokio::test]
+    async fn rendered_asset_export_requires_token_and_streams_ranges() {
+        let root = std::env::temp_dir().join(format!("tv7-export-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let clip = root.join("clip.mp4");
+        fs::write(&clip, b"0123456789").unwrap();
+        let mut context = test_setup_context();
+        context.asset_dir = root.clone();
+        let state = mock_app_state(Err(EngineError::Io("unused".into())), context);
+        let id = state.exports.register(clip);
+        let token = "t".repeat(48);
+        let app = build_router_with_auth(state, Some(token.clone()));
+        let uri = format!("/v1/media/assets/{id}");
+
+        let unauthorized = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let full = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(full.headers()[header::CONTENT_TYPE], "video/mp4");
+        assert_eq!(full.headers()[header::CONTENT_LENGTH], "10");
+        assert_eq!(
+            to_bytes(full.into_body(), 100).await.unwrap().as_ref(),
+            b"0123456789"
+        );
+        let partial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::RANGE, "bytes=2-4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(partial.headers()[header::CONTENT_RANGE], "bytes 2-4/10");
+        assert_eq!(
+            to_bytes(partial.into_body(), 100).await.unwrap().as_ref(),
+            b"234"
+        );
+        let invalid = app
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::RANGE, "bytes=20-30")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rendered_asset_export_rejects_outside_and_unknown_ids() {
+        let root = std::env::temp_dir().join(format!("tv7-export-root-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let outside =
+            std::env::temp_dir().join(format!("tv7-export-outside-{}.mp4", Uuid::new_v4()));
+        fs::write(&outside, b"secret").unwrap();
+        let mut context = test_setup_context();
+        context.asset_dir = root.clone();
+        let state = mock_app_state(Err(EngineError::Io("unused".into())), context);
+        let id = state.exports.register(outside.clone());
+        let app = build_router(state);
+        for uri in [
+            format!("/v1/media/assets/{id}"),
+            "/v1/media/assets/../outside.mp4".to_string(),
+            "/v1/media/assets/render-missing".to_string(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert!(matches!(
+                response.status(),
+                StatusCode::NOT_FOUND | StatusCode::BAD_REQUEST
+            ));
+        }
+        fs::remove_file(outside).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn render_response_gets_export_id_only_for_owned_mp4() {
+        let root = std::env::temp_dir().join(format!("tv7-render-owned-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let inside = root.join("inside.mp4");
+        let outside =
+            std::env::temp_dir().join(format!("tv7-render-outside-{}.mp4", Uuid::new_v4()));
+        fs::write(&inside, b"clip").unwrap();
+        fs::write(&outside, b"clip").unwrap();
+        let mut context = test_setup_context();
+        context.asset_dir = root.clone();
+        let mut state = mock_app_state(Err(EngineError::Io("unused".into())), context);
+        let body = serde_json::json!({"source_path":"/tmp/source.mp4","output_path":inside,"start_seconds":0.0,"end_seconds":1.0}).to_string();
+        for (path, expected_id) in [(&inside, true), (&outside, false)] {
+            state.clip_renderer = Arc::new(MockMediaProbe {
+                probe_response: Err(EngineError::Io("unused".into())),
+                thumbnail_response: Err(EngineError::Io("unused".into())),
+                render_response: Ok(RenderClipResult {
+                    output_path: path.to_string_lossy().to_string(),
+                    duration_seconds: 1.0,
+                    media_id: None,
+                }),
+            });
+            let (status, response) = request_json(
+                build_router(state.clone()),
+                "POST",
+                "/v1/media/render-clip",
+                Some(&body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(response["result"]["media_id"].is_string(), expected_id);
+        }
+        fs::remove_file(outside).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2076,9 +3631,15 @@ mod tests {
             "/v1/media/probe",
             "/v1/media/thumbnail",
             "/v1/media/render-clip",
+            "/v1/media/assets/{id}",
             "/v1/ingest/url",
+            "/v1/channels/discover",
+            "/v1/ingest/selected",
+            "/v1/ingest/file",
             "/v1/transcripts/download",
             "/v1/transcripts/generate",
+            "/v1/transcripts/candidates",
+            "/v1/transcripts/import",
             "/v1/jobs/{id}",
             "/v1/jobs/{id}/logs",
             "/v1/jobs/{id}/cancel",
@@ -2166,7 +3727,23 @@ mod tests {
                 "/v1/ingest/url",
                 "POST",
                 "/v1/ingest/url",
-                Some(r#"{"url":"https://example.com/video","output_dir":"/tmp"}"#),
+                Some(r#"{"url":"https://example.com/video"}"#),
+            ),
+            (
+                "post",
+                "/v1/channels/discover",
+                "POST",
+                "/v1/channels/discover",
+                Some(r#"{"url":"https://www.youtube.com/@creator/videos"}"#),
+            ),
+            (
+                "post",
+                "/v1/ingest/selected",
+                "POST",
+                "/v1/ingest/selected",
+                Some(
+                    r#"{"videos":[{"id":"abcdefghijk","url":"https://www.youtube.com/watch?v=abcdefghijk"}]}"#,
+                ),
             ),
             (
                 "post",
@@ -2370,7 +3947,7 @@ mod tests {
             app.clone(),
             "POST",
             "/v1/ingest/url",
-            Some(r#"{"url":"https://example.com/video","output_dir":"/tmp"}"#),
+            Some(r#"{"url":"https://example.com/video"}"#),
         )
         .await;
         for key in [
@@ -2382,6 +3959,31 @@ mod tests {
             "cancel_requested",
         ] {
             assert!(job_create["job"].get(key).is_some(), "missing job.{key}");
+        }
+
+        let (_, channel) = request_json(
+            app.clone(),
+            "POST",
+            "/v1/channels/discover",
+            Some(r#"{"url":"https://www.youtube.com/@creator/videos"}"#),
+        )
+        .await;
+        for key in ["channel_url", "videos", "next_cursor"] {
+            assert!(channel.get(key).is_some(), "missing channel.{key}");
+        }
+        for key in ["id", "url", "title", "duration_seconds", "thumbnail_url"] {
+            assert!(
+                channel["videos"][0].get(key).is_some(),
+                "missing channel video.{key}"
+            );
+        }
+
+        let (_, selected) = request_json(app.clone(), "POST", "/v1/ingest/selected", Some(r#"{"videos":[{"id":"abcdefghijk","url":"https://www.youtube.com/watch?v=abcdefghijk"}]}"#)).await;
+        for key in ["video_id", "job_id"] {
+            assert!(
+                selected["jobs"][0].get(key).is_some(),
+                "missing selected job.{key}"
+            );
         }
 
         let (_, logs) = request_json(app, "GET", "/v1/jobs/job_1/logs", None).await;
@@ -2606,6 +4208,7 @@ mod tests {
             render_response: Ok(RenderClipResult {
                 output_path: "/tmp/clip.mp4".to_string(),
                 duration_seconds: 10.0,
+                media_id: None,
             }),
         });
         let cloud = Arc::new(RecordingCloudAiExecutor::default());
@@ -2618,6 +4221,7 @@ mod tests {
             diagnostics_provider: mock.clone(),
             setup_provider: mock,
             jobs: JobStore::default(),
+            exports: ExportStore::default(),
             diagnostics_context: DiagnosticsContext::new(
                 env!("CARGO_PKG_VERSION"),
                 "127.0.0.1",
@@ -2659,6 +4263,7 @@ mod tests {
             render_response: Ok(RenderClipResult {
                 output_path: "/tmp/clip.mp4".to_string(),
                 duration_seconds: 10.0,
+                media_id: None,
             }),
         });
         let cloud = Arc::new(RecordingCloudAiExecutor::with_response(Err(CloudAiError {
@@ -2674,6 +4279,7 @@ mod tests {
             diagnostics_provider: mock.clone(),
             setup_provider: mock,
             jobs: JobStore::default(),
+            exports: ExportStore::default(),
             diagnostics_context: DiagnosticsContext::new(
                 env!("CARGO_PKG_VERSION"),
                 "127.0.0.1",
@@ -2713,6 +4319,7 @@ mod tests {
             render_response: Ok(RenderClipResult {
                 output_path: "/tmp/clip.mp4".to_string(),
                 duration_seconds: 10.0,
+                media_id: None,
             }),
         });
         let cloud = Arc::new(RecordingCloudAiExecutor::default());
@@ -2725,6 +4332,7 @@ mod tests {
             diagnostics_provider: mock.clone(),
             setup_provider: mock,
             jobs: JobStore::default(),
+            exports: ExportStore::default(),
             diagnostics_context: DiagnosticsContext::new(
                 env!("CARGO_PKG_VERSION"),
                 "127.0.0.1",
@@ -2795,6 +4403,7 @@ mod tests {
             render_response: Ok(RenderClipResult {
                 output_path: "/tmp/clip.mp4".to_string(),
                 duration_seconds: 10.0,
+                media_id: None,
             }),
         });
         let cloud = Arc::new(RecordingCloudAiExecutor::with_response(Ok(
@@ -2822,6 +4431,7 @@ mod tests {
             diagnostics_provider: mock.clone(),
             setup_provider: mock,
             jobs: JobStore::default(),
+            exports: ExportStore::default(),
             diagnostics_context: DiagnosticsContext::new(
                 env!("CARGO_PKG_VERSION"),
                 "127.0.0.1",
@@ -2909,7 +4519,7 @@ mod tests {
                     .method("POST")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"url":"https://example.com/video","output_dir":"/tmp","output_template":"video.%(ext)s"}"#,
+                        r#"{"url":"https://example.com/video","output_template":"video.%(ext)s"}"#,
                     ))
                     .expect("request should be valid"),
             )
@@ -3019,9 +4629,7 @@ mod tests {
                     .uri("/v1/ingest/url")
                     .method("POST")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"url":"https://example.com/video","output_dir":"/tmp"}"#,
-                    ))
+                    .body(Body::from(r#"{"url":"https://example.com/video"}"#))
                     .expect("request should be valid"),
             )
             .await
@@ -3057,6 +4665,7 @@ mod tests {
             render_response: Ok(RenderClipResult {
                 output_path: "/tmp/clip.mp4".to_string(),
                 duration_seconds: 10.0,
+                media_id: None,
             }),
         });
         let app = build_router(AppState {
@@ -3068,6 +4677,7 @@ mod tests {
             diagnostics_provider: mock.clone(),
             setup_provider: mock,
             jobs: JobStore::default(),
+            exports: ExportStore::default(),
             diagnostics_context: DiagnosticsContext::new(
                 env!("CARGO_PKG_VERSION"),
                 "127.0.0.1",
@@ -3125,6 +4735,7 @@ mod tests {
             render_response: Ok(RenderClipResult {
                 output_path: "/tmp/clip.mp4".to_string(),
                 duration_seconds: 10.0,
+                media_id: None,
             }),
         });
         let app = build_router(AppState {
@@ -3136,6 +4747,7 @@ mod tests {
             diagnostics_provider: mock.clone(),
             setup_provider: mock,
             jobs: JobStore::default(),
+            exports: ExportStore::default(),
             diagnostics_context: DiagnosticsContext::new(
                 env!("CARGO_PKG_VERSION"),
                 "127.0.0.1",
@@ -3154,9 +4766,7 @@ mod tests {
                     .uri("/v1/ingest/url")
                     .method("POST")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"url":"https://example.com/video","output_dir":"/tmp"}"#,
-                    ))
+                    .body(Body::from(r#"{"url":"https://example.com/video"}"#))
                     .expect("request should be valid"),
             )
             .await

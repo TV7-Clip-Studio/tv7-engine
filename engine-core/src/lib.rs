@@ -36,12 +36,199 @@ pub struct RenderClipRequest {
     pub output_path: String,
     pub start_seconds: f64,
     pub end_seconds: f64,
+    #[serde(default)]
+    pub subtitle_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RenderClipResult {
     pub output_path: String,
     pub duration_seconds: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CandidateRequest {
+    pub transcript_path: String,
+    pub max_candidates: Option<usize>,
+    pub max_duration_seconds: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TranscriptCandidate {
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub text: String,
+    pub cue_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CandidateResponse {
+    pub candidates: Vec<TranscriptCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VttMetadata {
+    pub cue_count: usize,
+    pub duration_seconds: f64,
+}
+
+pub fn inspect_vtt(path: &Path) -> Result<VttMetadata, EngineError> {
+    let cues = read_vtt(path)?;
+    Ok(VttMetadata {
+        cue_count: cues.len(),
+        duration_seconds: cues.iter().map(|cue| cue.end).fold(0.0, f64::max),
+    })
+}
+
+#[derive(Debug, Clone)]
+struct VttCue {
+    start: f64,
+    end: f64,
+    text: String,
+}
+
+pub fn generate_candidates(request: &CandidateRequest) -> Result<CandidateResponse, EngineError> {
+    let max_candidates = request.max_candidates.unwrap_or(8);
+    let max_duration = request.max_duration_seconds.unwrap_or(45.0);
+    if !(1..=12).contains(&max_candidates)
+        || !max_duration.is_finite()
+        || !(15.0..=90.0).contains(&max_duration)
+    {
+        return Err(EngineError::InvalidTimeRange(
+            "max_candidates must be 1..12 and max_duration_seconds must be 15..90".into(),
+        ));
+    }
+    let cues = read_vtt(Path::new(&request.transcript_path))?;
+    let mut windows = Vec::new();
+    let mut index = 0;
+    while index < cues.len() {
+        let first = index;
+        let start = cues[first].start;
+        index += 1;
+        while index < cues.len() && cues[index].end - start <= max_duration {
+            index += 1;
+        }
+        let group = &cues[first..index];
+        windows.push(TranscriptCandidate {
+            start_seconds: start,
+            end_seconds: group.last().unwrap().end.min(start + max_duration),
+            text: group
+                .iter()
+                .map(|cue| cue.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(2000)
+                .collect(),
+            cue_count: group.len(),
+        });
+    }
+    let count = max_candidates.min(windows.len());
+    let candidates = if count == 0 {
+        Vec::new()
+    } else if count == 1 {
+        vec![windows[0].clone()]
+    } else {
+        (0..count)
+            .map(|position| windows[position * (windows.len() - 1) / (count - 1)].clone())
+            .collect()
+    };
+    Ok(CandidateResponse { candidates })
+}
+
+fn read_vtt(path: &Path) -> Result<Vec<VttCue>, EngineError> {
+    if !path.is_absolute() {
+        return Err(EngineError::InvalidPath(
+            "transcript path must be absolute".into(),
+        ));
+    }
+    let metadata = fs::metadata(path).map_err(|_| EngineError::NotFound(path.to_path_buf()))?;
+    if !metadata.is_file() {
+        return Err(EngineError::NotFile(path.to_path_buf()));
+    }
+    if metadata.len() > 5 * 1024 * 1024 {
+        return Err(EngineError::OutputInvalid("VTT exceeds 5 MiB".into()));
+    }
+    let content =
+        fs::read_to_string(path).map_err(|error| EngineError::OutputInvalid(error.to_string()))?;
+    let normalized = content.trim_start_matches('\u{feff}').replace("\r\n", "\n");
+    if !normalized.starts_with("WEBVTT") {
+        return Err(EngineError::OutputInvalid("expected WEBVTT header".into()));
+    }
+    let mut cues = Vec::new();
+    for block in normalized.split("\n\n").skip(1) {
+        let mut lines = block.lines();
+        let first = lines.next().unwrap_or("");
+        let timing = if first.contains("-->") {
+            first
+        } else {
+            lines.next().unwrap_or("")
+        };
+        let Some((start, end)) = timing.split_once("-->") else {
+            continue;
+        };
+        let start = parse_vtt_time(start.trim())?;
+        let end = parse_vtt_time(end.split_whitespace().next().unwrap_or(""))?;
+        if end <= start {
+            return Err(EngineError::OutputInvalid(
+                "VTT cue end must exceed start".into(),
+            ));
+        }
+        let text = lines.collect::<Vec<_>>().join(" ").trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        if cues.len() >= 20_000 {
+            return Err(EngineError::OutputInvalid("VTT exceeds 20,000 cues".into()));
+        }
+        cues.push(VttCue { start, end, text });
+    }
+    cues.sort_by(|a, b| a.start.total_cmp(&b.start));
+    if cues.is_empty() {
+        return Err(EngineError::OutputInvalid(
+            "VTT contains no timed cues".into(),
+        ));
+    }
+    Ok(cues)
+}
+
+fn parse_vtt_time(value: &str) -> Result<f64, EngineError> {
+    let parts = value.split(':').collect::<Vec<_>>();
+    if !(2..=3).contains(&parts.len()) {
+        return Err(EngineError::OutputInvalid("invalid VTT timestamp".into()));
+    }
+    let seconds = parts
+        .last()
+        .unwrap()
+        .parse::<f64>()
+        .map_err(|_| EngineError::OutputInvalid("invalid VTT timestamp".into()))?;
+    let minutes = parts[parts.len() - 2]
+        .parse::<u64>()
+        .map_err(|_| EngineError::OutputInvalid("invalid VTT timestamp".into()))?;
+    let hours = if parts.len() == 3 {
+        parts[0]
+            .parse::<u64>()
+            .map_err(|_| EngineError::OutputInvalid("invalid VTT timestamp".into()))?
+    } else {
+        0
+    };
+    if !seconds.is_finite() || !(0.0..60.0).contains(&seconds) || minutes >= 60 {
+        return Err(EngineError::OutputInvalid("invalid VTT timestamp".into()));
+    }
+    Ok(hours as f64 * 3600.0 + minutes as f64 * 60.0 + seconds)
+}
+
+fn format_vtt_time(seconds: f64) -> String {
+    let millis = (seconds.max(0.0) * 1000.0).round() as u64;
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        millis / 3_600_000,
+        (millis / 60_000) % 60,
+        (millis / 1_000) % 60,
+        millis % 1_000
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,6 +243,28 @@ pub struct UrlIngestResult {
     pub url: String,
     pub media_path: Option<String>,
     pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChannelDiscoverRequest {
+    pub url: String,
+    pub cursor: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChannelVideo {
+    pub id: String,
+    pub url: String,
+    pub title: String,
+    pub duration_seconds: Option<f64>,
+    pub thumbnail_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChannelPage {
+    pub channel_url: String,
+    pub videos: Vec<ChannelVideo>,
+    pub next_cursor: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -360,6 +569,20 @@ pub struct ToolOutput {
 
 pub trait CommandExecutor: Send + Sync {
     fn run(&self, executable: &str, args: &[String]) -> Result<ToolOutput, EngineError>;
+    fn run_cancelable(
+        &self,
+        executable: &str,
+        args: &[String],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ToolOutput, EngineError> {
+        if cancelled() {
+            return Err(EngineError::CommandFailed {
+                command: executable.to_string(),
+                message: "cancelled".to_string(),
+            });
+        }
+        self.run(executable, args)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -380,6 +603,69 @@ impl CommandExecutor for ProcessCommandExecutor {
             stdout: output.stdout,
             stderr: output.stderr,
         })
+    }
+
+    fn run_cancelable(
+        &self,
+        executable: &str,
+        args: &[String],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<ToolOutput, EngineError> {
+        use std::io::Read;
+        use std::process::Stdio;
+        use std::thread;
+        use std::time::Duration;
+        let mut child = Command::new(executable)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| EngineError::CommandFailed {
+                command: executable.to_string(),
+                message: error.to_string(),
+            })?;
+        let mut stderr = child.stderr.take().expect("piped stderr should exist");
+        let stderr_reader = thread::spawn(move || {
+            let mut tail = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(read) = stderr.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                tail.extend_from_slice(&chunk[..read]);
+                if tail.len() > 64 * 1024 {
+                    tail.drain(..tail.len() - 64 * 1024);
+                }
+            }
+            tail
+        });
+        loop {
+            if cancelled() {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(EngineError::CommandFailed {
+                    command: executable.to_string(),
+                    message: "cancelled".to_string(),
+                });
+            }
+            match child
+                .try_wait()
+                .map_err(|error| EngineError::CommandFailed {
+                    command: executable.to_string(),
+                    message: error.to_string(),
+                })? {
+                Some(status) => {
+                    let stderr = stderr_reader.join().unwrap_or_default();
+                    return Ok(ToolOutput {
+                        status_success: status.success(),
+                        stdout: Vec::new(),
+                        stderr,
+                    });
+                }
+                None => thread::sleep(Duration::from_millis(100)),
+            }
+        }
     }
 }
 
@@ -409,6 +695,27 @@ pub trait RuntimeSetupProvider: Send + Sync {
 
 pub trait UrlIngestor: Send + Sync {
     fn ingest_url(&self, request: &UrlIngestRequest) -> Result<UrlIngestResult, EngineError>;
+    fn ingest_url_cancelable(
+        &self,
+        request: &UrlIngestRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<UrlIngestResult, EngineError> {
+        if cancelled() {
+            return Err(EngineError::CommandFailed {
+                command: "yt-dlp".to_string(),
+                message: "cancelled".to_string(),
+            });
+        }
+        self.ingest_url(request)
+    }
+    fn discover_channel(
+        &self,
+        _request: &ChannelDiscoverRequest,
+    ) -> Result<ChannelPage, EngineError> {
+        Err(EngineError::InvalidUrl(
+            "channel discovery unavailable".to_string(),
+        ))
+    }
 }
 
 pub trait TranscriptProvider: Send + Sync {
@@ -428,6 +735,7 @@ pub struct FfmpegMediaEngine {
     ffmpeg_bin: String,
     ffprobe_bin: String,
     yt_dlp_bin: String,
+    yt_dlp_js_runtime: Option<String>,
     whisper_bin: Option<String>,
     whisper_model: Option<PathBuf>,
     executor: Arc<dyn CommandExecutor>,
@@ -439,6 +747,7 @@ impl fmt::Debug for FfmpegMediaEngine {
             .field("ffmpeg_bin", &self.ffmpeg_bin)
             .field("ffprobe_bin", &self.ffprobe_bin)
             .field("yt_dlp_bin", &self.yt_dlp_bin)
+            .field("yt_dlp_js_runtime", &self.yt_dlp_js_runtime)
             .field("whisper_bin", &self.whisper_bin)
             .field("whisper_model", &self.whisper_model)
             .finish_non_exhaustive()
@@ -457,6 +766,7 @@ impl FfmpegMediaEngine {
             ffmpeg_bin: "ffmpeg".to_string(),
             ffprobe_bin: "ffprobe".to_string(),
             yt_dlp_bin: "yt-dlp".to_string(),
+            yt_dlp_js_runtime: None,
             whisper_bin: None,
             whisper_model: None,
             executor: Arc::new(ProcessCommandExecutor),
@@ -468,6 +778,7 @@ impl FfmpegMediaEngine {
             ffmpeg_bin: ffmpeg_bin.into(),
             ffprobe_bin: ffprobe_bin.into(),
             yt_dlp_bin: "yt-dlp".to_string(),
+            yt_dlp_js_runtime: None,
             whisper_bin: None,
             whisper_model: None,
             executor: Arc::new(ProcessCommandExecutor),
@@ -483,6 +794,7 @@ impl FfmpegMediaEngine {
             ffmpeg_bin: ffmpeg_bin.into(),
             ffprobe_bin: ffprobe_bin.into(),
             yt_dlp_bin: yt_dlp_bin.into(),
+            yt_dlp_js_runtime: None,
             whisper_bin: None,
             whisper_model: None,
             executor: Arc::new(ProcessCommandExecutor),
@@ -500,6 +812,7 @@ impl FfmpegMediaEngine {
             ffmpeg_bin: ffmpeg_bin.into(),
             ffprobe_bin: ffprobe_bin.into(),
             yt_dlp_bin: yt_dlp_bin.into(),
+            yt_dlp_js_runtime: None,
             whisper_bin,
             whisper_model,
             executor: Arc::new(ProcessCommandExecutor),
@@ -515,6 +828,7 @@ impl FfmpegMediaEngine {
             ffmpeg_bin: ffmpeg_bin.into(),
             ffprobe_bin: ffprobe_bin.into(),
             yt_dlp_bin: "yt-dlp".to_string(),
+            yt_dlp_js_runtime: None,
             whisper_bin: None,
             whisper_model: None,
             executor,
@@ -531,6 +845,7 @@ impl FfmpegMediaEngine {
             ffmpeg_bin: ffmpeg_bin.into(),
             ffprobe_bin: ffprobe_bin.into(),
             yt_dlp_bin: yt_dlp_bin.into(),
+            yt_dlp_js_runtime: None,
             whisper_bin: None,
             whisper_model: None,
             executor,
@@ -549,10 +864,23 @@ impl FfmpegMediaEngine {
             ffmpeg_bin: ffmpeg_bin.into(),
             ffprobe_bin: ffprobe_bin.into(),
             yt_dlp_bin: yt_dlp_bin.into(),
+            yt_dlp_js_runtime: None,
             whisper_bin,
             whisper_model,
             executor,
         }
+    }
+
+    pub fn with_ytdlp_js_runtime(mut self, runtime: Option<String>) -> Self {
+        self.yt_dlp_js_runtime = runtime;
+        self
+    }
+
+    fn ytdlp_js_args(&self) -> Vec<String> {
+        self.yt_dlp_js_runtime
+            .as_ref()
+            .map(|runtime| vec!["--js-runtimes".to_string(), runtime.clone()])
+            .unwrap_or_default()
     }
 
     fn validate_source_path(&self, path: &Path) -> Result<(), EngineError> {
@@ -711,16 +1039,91 @@ fn tool_version_args(name: &str) -> Vec<String> {
 }
 
 impl UrlIngestor for FfmpegMediaEngine {
+    fn discover_channel(
+        &self,
+        request: &ChannelDiscoverRequest,
+    ) -> Result<ChannelPage, EngineError> {
+        validate_youtube_channel_url(&request.url)?;
+        let channel_url = normalize_youtube_channel_url(&request.url);
+        let cursor = request.cursor.unwrap_or(0);
+        if cursor > 475 || cursor % 25 != 0 {
+            return Err(EngineError::InvalidUrl(
+                "cursor must be a multiple of 25 up to 475".to_string(),
+            ));
+        }
+        let start = cursor + 1;
+        let end = cursor + 25;
+        let mut args = self.ytdlp_js_args();
+        args.extend(vec![
+            "--flat-playlist".to_string(),
+            "--dump-single-json".to_string(),
+            "--playlist-items".to_string(),
+            format!("{start}:{end}"),
+            channel_url.clone(),
+        ]);
+        let output = self.run_checked(&self.yt_dlp_bin, &args)?;
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| EngineError::OutputInvalid(error.to_string()))?;
+        let entries = json
+            .get("entries")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| EngineError::OutputInvalid("missing channel entries".to_string()))?;
+        if entries.is_empty() && cursor == 0 {
+            return Err(EngineError::OutputInvalid(format!(
+                "YouTube channel returned no videos for {channel_url}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let videos = entries
+            .iter()
+            .take(25)
+            .filter_map(|entry| {
+                let id = entry.get("id")?.as_str()?;
+                if !valid_youtube_video_id(id) {
+                    return None;
+                }
+                Some(ChannelVideo {
+                    id: id.to_string(),
+                    url: format!("https://www.youtube.com/watch?v={id}"),
+                    title: entry
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Untitled video")
+                        .to_string(),
+                    duration_seconds: entry.get("duration").and_then(|v| v.as_f64()),
+                    thumbnail_url: entry
+                        .get("thumbnail")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(ChannelPage {
+            channel_url,
+            next_cursor: (entries.len() == 25 && cursor < 475).then_some(cursor + 25),
+            videos,
+        })
+    }
+
     fn ingest_url(&self, request: &UrlIngestRequest) -> Result<UrlIngestResult, EngineError> {
+        self.ingest_url_cancelable(request, &|| false)
+    }
+
+    fn ingest_url_cancelable(
+        &self,
+        request: &UrlIngestRequest,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<UrlIngestResult, EngineError> {
         self.validate_url(&request.url)?;
         let output_dir = Path::new(&request.output_dir);
         self.validate_output_dir(output_dir)?;
 
-        let metadata_args = vec![
+        let mut metadata_args = self.ytdlp_js_args();
+        metadata_args.extend(vec![
             "--dump-json".to_string(),
             "--skip-download".to_string(),
             request.url.clone(),
-        ];
+        ]);
         let metadata_output = self.run_checked(&self.yt_dlp_bin, &metadata_args)?;
         let metadata: serde_json::Value = serde_json::from_slice(&metadata_output.stdout)
             .map_err(|error| EngineError::OutputInvalid(error.to_string()))?;
@@ -731,12 +1134,21 @@ impl UrlIngestor for FfmpegMediaEngine {
             .clone()
             .unwrap_or_else(|| "%(title).200B.%(ext)s".to_string());
         let output_pattern = output_dir.join(template);
-        let download_args = vec![
+        let mut download_args = self.ytdlp_js_args();
+        download_args.extend(vec![
             "-o".to_string(),
             output_pattern.to_string_lossy().to_string(),
             request.url.clone(),
-        ];
-        self.run_checked(&self.yt_dlp_bin, &download_args)?;
+        ]);
+        let output = self
+            .executor
+            .run_cancelable(&self.yt_dlp_bin, &download_args, cancelled)?;
+        if !output.status_success {
+            return Err(EngineError::CommandFailed {
+                command: self.yt_dlp_bin.clone(),
+                message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            });
+        }
         let after = list_files(output_dir)?;
         let media_path = after
             .into_iter()
@@ -753,6 +1165,47 @@ impl UrlIngestor for FfmpegMediaEngine {
             media_path,
             metadata,
         })
+    }
+}
+
+pub fn valid_youtube_video_id(id: &str) -> bool {
+    id.len() == 11
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+pub fn validate_youtube_channel_url(url: &str) -> Result<(), EngineError> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| EngineError::InvalidUrl("channel URL must use https".to_string()))?;
+    let (host, path) = rest
+        .split_once('/')
+        .ok_or_else(|| EngineError::InvalidUrl("channel URL needs a path".to_string()))?;
+    if !matches!(host, "youtube.com" | "www.youtube.com")
+        || !(path.starts_with('@')
+            || path.starts_with("channel/")
+            || path.starts_with("c/")
+            || path.starts_with("user/"))
+        || path.contains('?')
+        || path.contains('#')
+        || path.contains("..")
+        || path.len() > 256
+    {
+        return Err(EngineError::InvalidUrl(
+            "expected a YouTube channel URL".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_youtube_channel_url(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    if trimmed.ends_with("/videos") || trimmed.ends_with("/shorts") || trimmed.ends_with("/streams")
+    {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/videos")
     }
 }
 
@@ -806,7 +1259,8 @@ impl TranscriptProvider for FfmpegMediaEngine {
             .strip_suffix(".vtt")
             .unwrap_or(&request.output_path)
             .to_string();
-        let args = vec![
+        let mut args = self.ytdlp_js_args();
+        args.extend(vec![
             "--write-auto-sub".to_string(),
             "--sub-lang".to_string(),
             language.clone(),
@@ -816,7 +1270,7 @@ impl TranscriptProvider for FfmpegMediaEngine {
             "-o".to_string(),
             output_base,
             request.url.clone(),
-        ];
+        ]);
         self.run_checked(&self.yt_dlp_bin, &args)?;
         let after = list_files(parent)?;
         let transcript_path = after
@@ -1005,7 +1459,15 @@ impl ClipRenderer for FfmpegMediaEngine {
             ));
         }
 
-        let args = vec![
+        let overlay = match request.subtitle_path.as_deref() {
+            Some(path) => Some(create_clip_subtitle_overlay(
+                Path::new(path),
+                request.start_seconds,
+                request.end_seconds,
+            )?),
+            None => None,
+        };
+        let mut args = vec![
             "-y".to_string(),
             "-i".to_string(),
             request.source_path.clone(),
@@ -1013,19 +1475,101 @@ impl ClipRenderer for FfmpegMediaEngine {
             request.start_seconds.to_string(),
             "-to".to_string(),
             request.end_seconds.to_string(),
+        ];
+        if let Some(overlay) = overlay.as_ref() {
+            args.extend([
+                "-vf".to_string(),
+                format!(
+                    "subtitles=filename={}",
+                    escape_ffmpeg_filter_path(&overlay.path)
+                ),
+            ]);
+        }
+        args.extend([
             "-c:v".to_string(),
             "libx264".to_string(),
             "-c:a".to_string(),
             "aac".to_string(),
             request.output_path.clone(),
-        ];
+        ]);
         self.run_checked(&self.ffmpeg_bin, &args)?;
 
         Ok(RenderClipResult {
             output_path: request.output_path.clone(),
             duration_seconds: request.end_seconds - request.start_seconds,
+            media_id: None,
         })
     }
+}
+
+struct TemporarySubtitle {
+    path: PathBuf,
+}
+
+impl Drop for TemporarySubtitle {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn create_clip_subtitle_overlay(
+    path: &Path,
+    start: f64,
+    end: f64,
+) -> Result<TemporarySubtitle, EngineError> {
+    use std::io::Write;
+    let cues = read_vtt(path)?;
+    let selected = cues
+        .into_iter()
+        .filter(|cue| cue.end > start && cue.start < end)
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Err(EngineError::OutputInvalid(
+            "subtitle VTT has no cues in clip range".into(),
+        ));
+    }
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = std::env::temp_dir().join(format!(
+        "tv7-clip-subtitles-{}-{unique}.vtt",
+        std::process::id()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|error| EngineError::Io(error.to_string()))?;
+    let guard = TemporarySubtitle { path: temp };
+    file.write_all(b"WEBVTT\n\n")
+        .map_err(|error| EngineError::Io(error.to_string()))?;
+    for cue in selected {
+        let cue_start = (cue.start.max(start) - start).max(0.0);
+        let cue_end = (cue.end.min(end) - start).max(0.0);
+        let block = format!(
+            "{} --> {}\n{}\n\n",
+            format_vtt_time(cue_start),
+            format_vtt_time(cue_end),
+            cue.text
+        );
+        file.write_all(block.as_bytes())
+            .map_err(|error| EngineError::Io(error.to_string()))?;
+    }
+    file.sync_all()
+        .map_err(|error| EngineError::Io(error.to_string()))?;
+    Ok(guard)
+}
+
+fn escape_ffmpeg_filter_path(path: &Path) -> String {
+    let mut escaped = String::new();
+    for character in path.to_string_lossy().chars() {
+        if matches!(character, '\\' | ':' | '\'' | ',' | ';' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 impl DiagnosticsProvider for FfmpegMediaEngine {
@@ -1040,11 +1584,18 @@ impl DiagnosticsProvider for FfmpegMediaEngine {
             &self.yt_dlp_bin,
             vec!["url_ingest".to_string(), "transcript".to_string()],
         );
+        let js_runtime = ToolDiagnostic {
+            name: "yt_dlp_js_runtime".to_string(),
+            available: Some(self.yt_dlp_js_runtime.is_some()),
+            version: self.yt_dlp_js_runtime.clone(),
+            required_for: vec!["url_ingest".to_string(), "transcript".to_string()],
+            error: self.yt_dlp_js_runtime.is_none().then_some("No supported JavaScript runtime selected; YouTube downloads may fail. Configure Node >=22 or Deno >=2.3.".to_string()),
+        };
 
         let probe_ready = ffprobe.available == Some(true);
         let thumbnail_ready = ffmpeg.available == Some(true);
         let render_ready = ffmpeg.available == Some(true);
-        let url_ingest_ready = yt_dlp.available == Some(true);
+        let url_ingest_ready = yt_dlp.available == Some(true) && js_runtime.available == Some(true);
         let all_ready = work_dir_diag.ready
             && probe_ready
             && thumbnail_ready
@@ -1081,15 +1632,15 @@ impl DiagnosticsProvider for FfmpegMediaEngine {
                 CapabilityDiagnostic {
                     name: "url_ingest".to_string(),
                     status: status_for(url_ingest_ready),
-                    required_tools: vec![self.yt_dlp_bin.clone()],
+                    required_tools: vec![self.yt_dlp_bin.clone(), "yt_dlp_js_runtime".to_string()],
                 },
                 CapabilityDiagnostic {
                     name: "transcript".to_string(),
                     status: status_for(url_ingest_ready),
-                    required_tools: vec![self.yt_dlp_bin.clone()],
+                    required_tools: vec![self.yt_dlp_bin.clone(), "yt_dlp_js_runtime".to_string()],
                 },
             ],
-            tools: vec![ffprobe, ffmpeg, yt_dlp],
+            tools: vec![ffprobe, ffmpeg, yt_dlp, js_runtime],
             work_dir: work_dir_diag,
         }
     }
@@ -1238,6 +1789,21 @@ impl RuntimeSetupProvider for FfmpegMediaEngine {
                 &context.platform,
             ),
             capabilities: vec![
+                SetupCapabilityStatus {
+                    name: "url_ingest".to_string(),
+                    status: setup_status_for(self.yt_dlp_js_runtime.is_some()),
+                    provider: self
+                        .yt_dlp_js_runtime
+                        .as_ref()
+                        .map(|_| ProviderSource::UserPath),
+                    missing: if self.yt_dlp_js_runtime.is_some() {
+                        Vec::new()
+                    } else {
+                        vec!["javascript_runtime".to_string()]
+                    },
+                    installable: false,
+                    user_action_required: self.yt_dlp_js_runtime.is_none(),
+                },
                 SetupCapabilityStatus {
                     name: "transcription".to_string(),
                     status: setup_status_for(transcription_ready),
@@ -1840,6 +2406,152 @@ mod tests {
             .unwrap_or(false)
     }
 
+    #[test]
+    fn channel_discovery_is_bounded_and_does_not_download() {
+        let output =
+            success_output(br#"{"entries":[{"id":"abcdefghijk","title":"First","duration":42}]}"#);
+        let executor = Arc::new(MockExecutor::new(vec![Ok(output)]));
+        let engine = FfmpegMediaEngine::with_all_bins_and_executor(
+            "ffmpeg",
+            "ffprobe",
+            "yt-dlp",
+            executor.clone(),
+        );
+        let page = engine
+            .discover_channel(&ChannelDiscoverRequest {
+                url: "https://www.youtube.com/@creator/videos".into(),
+                cursor: Some(25),
+            })
+            .unwrap();
+        assert_eq!(page.videos.len(), 1);
+        assert_eq!(
+            page.videos[0].url,
+            "https://www.youtube.com/watch?v=abcdefghijk"
+        );
+        assert_eq!(page.next_cursor, None);
+        let calls = executor.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].1.contains(&"--skip-download".to_string()));
+        assert!(calls[0].1.contains(&"--flat-playlist".to_string()));
+        assert!(calls[0].1.contains(&"26:50".to_string()));
+    }
+
+    #[test]
+    fn channel_discovery_passes_explicit_js_runtime_to_ytdlp() {
+        let executor = Arc::new(MockExecutor::new(vec![Ok(success_output(
+            br#"{"entries":[{"id":"abcdefghijk"}]}"#,
+        ))]));
+        let engine = FfmpegMediaEngine::with_all_bins_and_executor(
+            "ffmpeg",
+            "ffprobe",
+            "yt-dlp",
+            executor.clone(),
+        )
+        .with_ytdlp_js_runtime(Some("node".into()));
+        engine
+            .discover_channel(&ChannelDiscoverRequest {
+                url: "https://www.youtube.com/@creator/videos".into(),
+                cursor: None,
+            })
+            .unwrap();
+        let calls = executor.calls();
+        assert_eq!(
+            &calls[0].1[..2],
+            &["--js-runtimes".to_string(), "node".to_string()]
+        );
+        assert_eq!(
+            calls[0].1.last().unwrap(),
+            "https://www.youtube.com/@creator/videos"
+        );
+    }
+
+    #[test]
+    fn setup_status_reports_missing_ytdlp_js_runtime() {
+        let executor = Arc::new(MockExecutor::new(vec![
+            Err(EngineError::CommandFailed {
+                command: "whisper".into(),
+                message: "missing".into(),
+            }),
+            Err(EngineError::CommandFailed {
+                command: "whisper".into(),
+                message: "missing".into(),
+            }),
+            Err(EngineError::CommandFailed {
+                command: "ollama".into(),
+                message: "missing".into(),
+            }),
+        ]));
+        let engine =
+            FfmpegMediaEngine::with_all_bins_and_executor("ffmpeg", "ffprobe", "yt-dlp", executor);
+        let status = engine.setup_status(&SetupContext::new(
+            "test",
+            std::env::temp_dir(),
+            None,
+            None,
+            "ollama",
+            None,
+            false,
+        ));
+        let ingest = status
+            .capabilities
+            .iter()
+            .find(|capability| capability.name == "url_ingest")
+            .unwrap();
+        assert_eq!(ingest.status, SetupCapabilityState::NotReady);
+        assert_eq!(ingest.missing, vec!["javascript_runtime"]);
+    }
+
+    #[test]
+    fn channel_discovery_rejects_unbounded_or_non_youtube_inputs() {
+        let engine = FfmpegMediaEngine::new();
+        for (url, cursor) in [
+            ("https://evil.example/@creator", None),
+            ("http://www.youtube.com/@creator", None),
+            ("https://www.youtube.com/@creator", Some(500)),
+            ("https://www.youtube.com/@creator", Some(1)),
+        ] {
+            assert!(
+                engine
+                    .discover_channel(&ChannelDiscoverRequest {
+                        url: url.into(),
+                        cursor
+                    })
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_executor_terminates_cancelled_download_command() {
+        let executor = ProcessCommandExecutor;
+        let polls = std::cell::Cell::new(0usize);
+        let started = std::time::Instant::now();
+        let result = executor.run_cancelable("sleep", &["5".to_string()], &|| {
+            polls.set(polls.get() + 1);
+            polls.get() > 1
+        });
+        assert!(result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_executor_preserves_failure_stderr() {
+        let output = ProcessCommandExecutor
+            .run_cancelable(
+                "sh",
+                &[
+                    "-c".to_string(),
+                    "echo download-failed >&2; exit 7".to_string(),
+                ],
+                &|| false,
+            )
+            .unwrap();
+        assert!(!output.status_success);
+        assert!(String::from_utf8_lossy(&output.stderr).contains("download-failed"));
+    }
+
     fn generate_tiny_video(path: &Path) {
         let output = Command::new("ffmpeg")
             .args([
@@ -1921,6 +2633,7 @@ mod tests {
                 output_path: output_path.to_string_lossy().to_string(),
                 start_seconds: 10.0,
                 end_seconds: 5.0,
+                subtitle_path: None,
             })
             .expect_err("invalid range should fail");
 
@@ -1962,6 +2675,7 @@ mod tests {
                 output_path: path,
                 start_seconds: 0.0,
                 end_seconds: 1.0,
+                subtitle_path: None,
             })
             .expect_err("same source and output should fail");
 
@@ -2234,6 +2948,72 @@ mod tests {
     }
 
     #[test]
+    fn transcript_candidates_are_bounded_deterministic_ranges() {
+        let root = TestTempDir::new("tv7-candidates");
+        let path = root.path().join("transcript.vtt");
+        fs::write(&path, "WEBVTT\n\n00:00:00.000 --> 00:00:20.000\nFirst idea.\n\n00:00:20.000 --> 00:00:40.000\nMore detail.\n\n00:00:50.000 --> 00:01:10.000\nSecond idea.\n\n00:01:10.000 --> 00:01:30.000\nConclusion.\n").unwrap();
+        let request = CandidateRequest {
+            transcript_path: path.to_string_lossy().to_string(),
+            max_candidates: Some(2),
+            max_duration_seconds: Some(45.0),
+        };
+        let response = generate_candidates(&request).unwrap();
+        assert_eq!(response.candidates.len(), 2);
+        assert_eq!(
+            (
+                response.candidates[0].start_seconds,
+                response.candidates[0].end_seconds
+            ),
+            (0.0, 40.0)
+        );
+        assert_eq!(
+            (
+                response.candidates[1].start_seconds,
+                response.candidates[1].end_seconds
+            ),
+            (50.0, 90.0)
+        );
+        assert_eq!(response.candidates[0].cue_count, 2);
+        assert_eq!(generate_candidates(&request).unwrap(), response);
+    }
+
+    #[test]
+    fn transcript_candidates_reject_invalid_vtt_and_unbounded_inputs() {
+        let root = TestTempDir::new("tv7-invalid-candidates");
+        let path = root.path().join("transcript.vtt");
+        fs::write(&path, "not VTT").unwrap();
+        let mut request = CandidateRequest {
+            transcript_path: path.to_string_lossy().to_string(),
+            max_candidates: None,
+            max_duration_seconds: None,
+        };
+        assert!(generate_candidates(&request).is_err());
+        request.max_candidates = Some(13);
+        assert!(matches!(
+            generate_candidates(&request),
+            Err(EngineError::InvalidTimeRange(_))
+        ));
+    }
+
+    #[test]
+    fn subtitle_overlay_is_clip_relative_and_cleans_up() {
+        let root = TestTempDir::new("tv7-subtitle-overlay");
+        let path = root.path().join("transcript.vtt");
+        fs::write(
+            &path,
+            "WEBVTT\n\n00:00:10.000 --> 00:00:20.000\nShown caption\n",
+        )
+        .unwrap();
+        let overlay = create_clip_subtitle_overlay(&path, 12.0, 18.0).unwrap();
+        let text = fs::read_to_string(&overlay.path).unwrap();
+        assert!(text.contains("00:00:00.000 --> 00:00:06.000"));
+        let overlay_path = overlay.path.clone();
+        drop(overlay);
+        assert!(!overlay_path.exists());
+        assert!(escape_ffmpeg_filter_path(Path::new("/tmp/a:b,c.vtt")).contains("a\\:b\\,c"));
+    }
+
+    #[test]
     fn generate_transcript_runs_configured_whisper_and_returns_vtt_path() {
         let temp_root = TestTempDir::new("tv7-engine-transcript-test");
         let media_path = temp_root.path().join("video.mp4");
@@ -2312,6 +3092,7 @@ mod tests {
                 output_path: clip_path.to_string_lossy().to_string(),
                 start_seconds: 0.25,
                 end_seconds: 1.25,
+                subtitle_path: None,
             })
             .expect("clip should be rendered");
         assert_eq!(
@@ -2321,6 +3102,26 @@ mod tests {
         assert_eq!(rendered.duration_seconds, 1.0);
         assert!(clip_path.exists());
         assert!(fs::metadata(&clip_path).expect("clip metadata").len() > 0);
+
+        let subtitle_path = unique_temp_file_path("vtt");
+        let captioned_path = unique_temp_file_path("mp4");
+        fs::write(
+            &subtitle_path,
+            "WEBVTT\n\n00:00:00.000 --> 00:00:01.500\nLocal subtitle\n",
+        )
+        .unwrap();
+        engine
+            .render_clip(&RenderClipRequest {
+                source_path: source_path.to_string_lossy().to_string(),
+                output_path: captioned_path.to_string_lossy().to_string(),
+                start_seconds: 0.25,
+                end_seconds: 1.25,
+                subtitle_path: Some(subtitle_path.to_string_lossy().to_string()),
+            })
+            .expect("captioned clip should render with ffmpeg subtitles filter");
+        assert!(captioned_path.is_file());
+        let _ = fs::remove_file(&subtitle_path);
+        let _ = fs::remove_file(&captioned_path);
 
         let clip_metadata = engine
             .probe_path(&clip_path)
