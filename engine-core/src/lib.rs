@@ -38,6 +38,19 @@ pub struct RenderClipRequest {
     pub end_seconds: f64,
     #[serde(default)]
     pub subtitle_path: Option<String>,
+    #[serde(default)]
+    pub format: RenderFormat,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RenderFormat {
+    #[default]
+    #[serde(rename = "source")]
+    Source,
+    #[serde(rename = "vertical_9_16")]
+    Vertical9x16,
+    #[serde(rename = "vertical_9_16_crop")]
+    Vertical9x16Crop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -80,6 +93,24 @@ pub fn inspect_vtt(path: &Path) -> Result<VttMetadata, EngineError> {
         cue_count: cues.len(),
         duration_seconds: cues.iter().map(|cue| cue.end).fold(0.0, f64::max),
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimedTranscriptCue {
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub text: String,
+}
+
+pub fn read_vtt_cues(path: &Path) -> Result<Vec<TimedTranscriptCue>, EngineError> {
+    Ok(read_vtt(path)?
+        .into_iter()
+        .map(|cue| TimedTranscriptCue {
+            start_seconds: cue.start,
+            end_seconds: cue.end,
+            text: cue.text,
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone)]
@@ -1552,18 +1583,30 @@ impl ClipRenderer for FfmpegMediaEngine {
             "-to".to_string(),
             request.end_seconds.to_string(),
         ];
+        let mut filters = Vec::new();
+        if request.format == RenderFormat::Vertical9x16 {
+            filters.push("scale=1080:1920:force_original_aspect_ratio=decrease".to_string());
+            filters.push("pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black".to_string());
+            filters.push("setsar=1".to_string());
+        } else if request.format == RenderFormat::Vertical9x16Crop {
+            filters.push("scale=1080:1920:force_original_aspect_ratio=increase".to_string());
+            filters.push("crop=1080:1920".to_string());
+            filters.push("setsar=1".to_string());
+        }
         if let Some(overlay) = overlay.as_ref() {
-            args.extend([
-                "-vf".to_string(),
-                format!(
-                    "subtitles=filename={}",
-                    escape_ffmpeg_filter_path(&overlay.path)
-                ),
-            ]);
+            filters.push(format!(
+                "subtitles=filename={}",
+                escape_ffmpeg_filter_path(&overlay.path)
+            ));
+        }
+        if !filters.is_empty() {
+            args.extend(["-vf".to_string(), filters.join(",")]);
         }
         args.extend([
             "-c:v".to_string(),
             "libx264".to_string(),
+            "-pix_fmt".to_string(),
+            "yuv420p".to_string(),
             "-c:a".to_string(),
             "aac".to_string(),
             request.output_path.clone(),
@@ -2695,10 +2738,16 @@ mod tests {
                 "lavfi",
                 "-i",
                 "testsrc=size=160x90:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100",
                 "-t",
                 "2",
                 "-pix_fmt",
                 "yuv420p",
+                "-c:a",
+                "aac",
             ])
             .arg(path)
             .output()
@@ -2769,11 +2818,38 @@ mod tests {
                 start_seconds: 10.0,
                 end_seconds: 5.0,
                 subtitle_path: None,
+                format: RenderFormat::Source,
             })
             .expect_err("invalid range should fail");
 
         assert!(matches!(error, EngineError::InvalidTimeRange(_)));
         fs::remove_file(file_path).expect("fixture file should be removed");
+    }
+
+    #[test]
+    fn render_format_defaults_to_source_and_rejects_unknown_values() {
+        let base = serde_json::json!({
+            "source_path": "/tmp/source.mp4",
+            "output_path": "/tmp/clip.mp4",
+            "start_seconds": 0.0,
+            "end_seconds": 1.0
+        });
+        let default_request: RenderClipRequest = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(default_request.format, RenderFormat::Source);
+
+        let mut vertical = base.clone();
+        vertical["format"] = serde_json::json!("vertical_9_16");
+        let vertical_request: RenderClipRequest = serde_json::from_value(vertical).unwrap();
+        assert_eq!(vertical_request.format, RenderFormat::Vertical9x16);
+
+        let mut crop = base.clone();
+        crop["format"] = serde_json::json!("vertical_9_16_crop");
+        let crop_request: RenderClipRequest = serde_json::from_value(crop).unwrap();
+        assert_eq!(crop_request.format, RenderFormat::Vertical9x16Crop);
+
+        let mut invalid = base;
+        invalid["format"] = serde_json::json!("arbitrary_ffmpeg_filter");
+        assert!(serde_json::from_value::<RenderClipRequest>(invalid).is_err());
     }
 
     #[test]
@@ -2811,6 +2887,7 @@ mod tests {
                 start_seconds: 0.0,
                 end_seconds: 1.0,
                 subtitle_path: None,
+                format: RenderFormat::Source,
             })
             .expect_err("same source and output should fail");
 
@@ -3373,6 +3450,7 @@ mod tests {
                 start_seconds: 0.25,
                 end_seconds: 1.25,
                 subtitle_path: None,
+                format: RenderFormat::Source,
             })
             .expect("clip should be rendered");
         assert_eq!(
@@ -3385,6 +3463,8 @@ mod tests {
 
         let subtitle_path = unique_temp_file_path("vtt");
         let captioned_path = unique_temp_file_path("mp4");
+        let vertical_path = unique_temp_file_path("mp4");
+        let crop_path = unique_temp_file_path("mp4");
         fs::write(
             &subtitle_path,
             "WEBVTT\n\n00:00:00.000 --> 00:00:01.500\nLocal subtitle\n",
@@ -3397,11 +3477,94 @@ mod tests {
                 start_seconds: 0.25,
                 end_seconds: 1.25,
                 subtitle_path: Some(subtitle_path.to_string_lossy().to_string()),
+                format: RenderFormat::Source,
             })
             .expect("captioned clip should render with ffmpeg subtitles filter");
         assert!(captioned_path.is_file());
+        engine
+            .render_clip(&RenderClipRequest {
+                source_path: source_path.to_string_lossy().to_string(),
+                output_path: vertical_path.to_string_lossy().to_string(),
+                start_seconds: 0.25,
+                end_seconds: 0.75,
+                subtitle_path: Some(subtitle_path.to_string_lossy().to_string()),
+                format: RenderFormat::Vertical9x16,
+            })
+            .expect("vertical captioned clip should render");
+        let vertical_metadata = engine
+            .probe_path(&vertical_path)
+            .expect("vertical clip should be probeable");
+        assert_eq!(
+            (vertical_metadata.width, vertical_metadata.height),
+            (Some(1080), Some(1920))
+        );
+        let streams = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,pix_fmt",
+                "-of",
+                "json",
+            ])
+            .arg(&vertical_path)
+            .output()
+            .expect("ffprobe should inspect vertical clip streams");
+        assert!(streams.status.success());
+        let streams: serde_json::Value = serde_json::from_slice(&streams.stdout).unwrap();
+        let streams = streams["streams"].as_array().unwrap();
+        assert!(
+            streams
+                .iter()
+                .any(|stream| stream["codec_type"] == "video" && stream["pix_fmt"] == "yuv420p")
+        );
+        assert!(streams.iter().any(|stream| stream["codec_type"] == "audio"));
+        engine
+            .render_clip(&RenderClipRequest {
+                source_path: source_path.to_string_lossy().to_string(),
+                output_path: crop_path.to_string_lossy().to_string(),
+                start_seconds: 0.25,
+                end_seconds: 0.75,
+                subtitle_path: Some(subtitle_path.to_string_lossy().to_string()),
+                format: RenderFormat::Vertical9x16Crop,
+            })
+            .expect("cropped vertical captioned clip should render");
+        let crop_metadata = engine
+            .probe_path(&crop_path)
+            .expect("cropped vertical clip should be probeable");
+        assert_eq!(
+            (crop_metadata.width, crop_metadata.height),
+            (Some(1080), Some(1920))
+        );
+        let crop_streams = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,pix_fmt",
+                "-of",
+                "json",
+            ])
+            .arg(&crop_path)
+            .output()
+            .expect("ffprobe should inspect cropped clip streams");
+        assert!(crop_streams.status.success());
+        let crop_streams: serde_json::Value = serde_json::from_slice(&crop_streams.stdout).unwrap();
+        let crop_streams = crop_streams["streams"].as_array().unwrap();
+        assert!(
+            crop_streams
+                .iter()
+                .any(|stream| stream["codec_type"] == "video" && stream["pix_fmt"] == "yuv420p")
+        );
+        assert!(
+            crop_streams
+                .iter()
+                .any(|stream| stream["codec_type"] == "audio")
+        );
         let _ = fs::remove_file(&subtitle_path);
         let _ = fs::remove_file(&captioned_path);
+        let _ = fs::remove_file(&vertical_path);
+        let _ = fs::remove_file(&crop_path);
 
         let clip_metadata = engine
             .probe_path(&clip_path)

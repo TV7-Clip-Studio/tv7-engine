@@ -13,7 +13,7 @@ use engine_core::{
     RenderClipResult, RuntimeSetupProvider, SetupCapabilityState, SetupContext, SetupManifest,
     SetupStatus, ThumbnailGenerator, ThumbnailRequest, ThumbnailResult, TranscriptDownloadRequest,
     TranscriptGenerateRequest, TranscriptProvider, UrlIngestRequest, UrlIngestor,
-    generate_candidates, inspect_vtt, valid_youtube_video_id,
+    generate_candidates, inspect_vtt, read_vtt_cues, valid_youtube_video_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -614,6 +614,8 @@ struct CloudAiExecuteRequest {
     model: Option<String>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -780,30 +782,96 @@ fn validate_transcript_intelligence_request(
             "transcript must contain at least one cue",
         ));
     }
+    if request.transcript.len() > 10_000 {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "AI_CONTEXT_TOO_LARGE",
+            "transcript exceeds 10,000 cues",
+        ));
+    }
+    let mut previous_start = -1.0_f64;
     for cue in &request.transcript {
-        if cue.text.trim().is_empty() {
+        if cue.text.trim().is_empty() || cue.text.len() > 4_000 {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "INVALID_TRANSCRIPT",
                 "transcript cue text must not be empty",
             ));
         }
-        if cue.start_seconds < 0.0 || cue.end_seconds <= cue.start_seconds {
+        if !cue.start_seconds.is_finite()
+            || !cue.end_seconds.is_finite()
+            || cue.start_seconds < 0.0
+            || cue.end_seconds <= cue.start_seconds
+            || cue.start_seconds < previous_start
+        {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "INVALID_TRANSCRIPT",
                 "transcript cue times must be non-negative and increasing",
             ));
         }
+        previous_start = cue.start_seconds;
     }
-    if matches!(request.max_suggestions, Some(0)) {
+    if matches!(request.max_suggestions, Some(0 | 13..)) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "INVALID_AI_OPTIONS",
-            "max_suggestions must be positive",
+            "max_suggestions must be 1..12",
         ));
     }
+    if let Some(existing) = &request.existing_clips {
+        if existing.len() > 1_000
+            || existing.iter().any(|clip| {
+                !clip.start_seconds.is_finite()
+                    || !clip.end_seconds.is_finite()
+                    || clip.start_seconds < 0.0
+                    || clip.end_seconds <= clip.start_seconds
+            })
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_AI_OPTIONS",
+                "existing clips must be finite positive ranges (at most 1,000)",
+            ));
+        }
+    }
     Ok(())
+}
+
+const AI_MAX_CHUNK_CUES: usize = 400;
+const AI_MAX_CHUNK_CHARS: usize = 24_000;
+const AI_MAX_CHUNKS: usize = 32;
+
+fn transcript_chunks(cues: &[TranscriptCue]) -> Result<Vec<&[TranscriptCue]>, CloudAiError> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < cues.len() {
+        let mut end = start;
+        let mut chars = 0;
+        while end < cues.len() && end - start < AI_MAX_CHUNK_CUES {
+            let next = cues[end].text.len() + 48;
+            if end > start && chars + next > AI_MAX_CHUNK_CHARS {
+                break;
+            }
+            if next > AI_MAX_CHUNK_CHARS {
+                return Err(CloudAiError {
+                    code: CloudAiErrorCode::ContextTooLarge,
+                    message: "one transcript cue exceeds the AI chunk limit".into(),
+                });
+            }
+            chars += next;
+            end += 1;
+        }
+        chunks.push(&cues[start..end]);
+        if chunks.len() > AI_MAX_CHUNKS {
+            return Err(CloudAiError {
+                code: CloudAiErrorCode::ContextTooLarge,
+                message: "transcript requires more than 32 AI requests; split the video".into(),
+            });
+        }
+        start = end;
+    }
+    Ok(chunks)
 }
 
 async fn execute_cloud_transcript_intelligence(
@@ -817,38 +885,186 @@ async fn execute_cloud_transcript_intelligence(
             code: CloudAiErrorCode::AuthRequired,
             message: "missing delegated cloud AI token".to_string(),
         })?;
-    let cloud_request = CloudAiExecuteRequest {
-        messages: build_transcript_intelligence_messages(request),
-        model: None,
-        temperature: Some(0.2),
-        max_tokens: Some(1400),
-    };
-    let cloud_response = state
-        .cloud_ai_executor
-        .execute(&token, &cloud_request)
-        .await?;
-    let envelope: AiClipSuggestionEnvelope = serde_json::from_str(&cloud_response.content)
-        .map_err(|error| CloudAiError {
-            code: CloudAiErrorCode::ProviderUnavailable,
-            message: format!("cloud AI returned invalid transcript intelligence JSON: {error}"),
-        })?;
-    validate_ai_clip_suggestions(&envelope.clips)?;
+    let chunks = transcript_chunks(&request.transcript)?;
+    let mut clips = Vec::new();
+    let mut model = String::new();
+    let mut usage: Option<CloudAiUsage> = None;
+    for cues in chunks {
+        let cloud_request = CloudAiExecuteRequest {
+            messages: build_transcript_intelligence_messages(request, cues),
+            model: None,
+            temperature: Some(0.2),
+            max_tokens: Some(1400),
+            response_format: Some("json_object".to_string()),
+        };
+        let cloud_response = state
+            .cloud_ai_executor
+            .execute(&token, &cloud_request)
+            .await?;
+        let envelope = parse_ai_clip_envelope(&cloud_response.content)?;
+        model = cloud_response.model;
+        usage = Some(match usage {
+            None => cloud_response.usage,
+            Some(mut total) => {
+                let next = cloud_response.usage;
+                total.credits_charged = total.credits_charged.saturating_add(next.credits_charged);
+                total.credits_remaining = next.credits_remaining;
+                total.prompt_tokens = sum_usage(total.prompt_tokens, next.prompt_tokens);
+                total.completion_tokens =
+                    sum_usage(total.completion_tokens, next.completion_tokens);
+                total.total_tokens = sum_usage(total.total_tokens, next.total_tokens);
+                total.latency_ms = sum_usage(total.latency_ms, next.latency_ms);
+                total
+            }
+        });
+        clips.extend(
+            envelope
+                .clips
+                .into_iter()
+                .filter(|clip| valid_ai_clip(clip, cues)),
+        );
+    }
+    clips.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.start_seconds.total_cmp(&b.start_seconds))
+    });
+    let mut selected: Vec<AiClipSuggestion> = Vec::new();
+    for clip in clips {
+        if request.timeline_target == TimelineTarget::UnclippedGapsOnly
+            && request.existing_clips.as_ref().is_some_and(|existing| {
+                existing.iter().any(|other| {
+                    range_overlap_fraction(
+                        clip.start_seconds,
+                        clip.end_seconds,
+                        other.start_seconds,
+                        other.end_seconds,
+                    ) > 0.15
+                })
+            })
+        {
+            continue;
+        }
+        if selected.iter().any(|other| {
+            range_overlap_fraction(
+                clip.start_seconds,
+                clip.end_seconds,
+                other.start_seconds,
+                other.end_seconds,
+            ) > 0.5
+        }) {
+            continue;
+        }
+        selected.push(clip);
+        if selected.len() == request.max_suggestions.unwrap_or(6) {
+            break;
+        }
+    }
     Ok(TranscriptIntelligenceResponse {
         provider: ProviderExecutionSource::Tv7Cloud,
-        model: cloud_response.model,
-        clips: envelope.clips,
-        usage: Some(cloud_response.usage),
+        model,
+        clips: selected,
+        usage,
     })
+}
+
+fn parse_ai_clip_envelope(content: &str) -> Result<AiClipSuggestionEnvelope, CloudAiError> {
+    let invalid = || CloudAiError {
+        code: CloudAiErrorCode::ProviderUnavailable,
+        message: "cloud AI returned invalid or ambiguous transcript intelligence JSON".into(),
+    };
+    let content = content.trim();
+    if let Ok(envelope) = serde_json::from_str::<AiClipSuggestionEnvelope>(content) {
+        return Ok(envelope);
+    }
+    let start = content.find('{').ok_or_else(invalid)?;
+    let mut depth = 0_u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut end = None;
+    for (offset, byte) in content.as_bytes()[start..].iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match *byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1).ok_or_else(invalid)?;
+                if depth == 0 {
+                    end = Some(start + offset + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end.ok_or_else(invalid)?;
+    // Surrounding prose and Markdown fences are tolerated, but a second JSON
+    // object/array makes the intended answer ambiguous.
+    let outside = format!("{}{}", &content[..start], &content[end..]);
+    if outside
+        .chars()
+        .any(|ch| matches!(ch, '{' | '}' | '[' | ']'))
+    {
+        return Err(invalid());
+    }
+    serde_json::from_str(&content[start..end]).map_err(|_| invalid())
+}
+
+fn sum_usage(previous: Option<i64>, next: Option<i64>) -> Option<i64> {
+    match (previous, next) {
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        _ => None,
+    }
+}
+
+fn range_overlap_fraction(start: f64, end: f64, other_start: f64, other_end: f64) -> f64 {
+    ((end.min(other_end) - start.max(other_start)).max(0.0))
+        / (end - start).min(other_end - other_start)
+}
+
+fn valid_ai_clip(clip: &AiClipSuggestion, cues: &[TranscriptCue]) -> bool {
+    if clip.title.trim().is_empty()
+        || clip.title.len() > 200
+        || clip.reason.trim().is_empty()
+        || clip.reason.len() > 600
+        || !clip.start_seconds.is_finite()
+        || !clip.end_seconds.is_finite()
+        || !clip.score.is_finite()
+        || !(0.0..=1.0).contains(&clip.score)
+        || clip.start_seconds < cues[0].start_seconds - 0.25
+        || clip.end_seconds > cues.last().unwrap().end_seconds + 0.25
+        || clip.end_seconds - clip.start_seconds < 3.0
+        || clip.end_seconds - clip.start_seconds > 90.0
+    {
+        return false;
+    }
+    // Require the proposed range to contain spoken source material, not a silent gap.
+    let covered: f64 = cues
+        .iter()
+        .map(|cue| {
+            (clip.end_seconds.min(cue.end_seconds) - clip.start_seconds.max(cue.start_seconds))
+                .max(0.0)
+        })
+        .sum();
+    covered >= 1.0 && covered / (clip.end_seconds - clip.start_seconds) >= 0.2
 }
 
 fn build_transcript_intelligence_messages(
     request: &TranscriptIntelligenceRequest,
+    cues: &[TranscriptCue],
 ) -> Vec<CloudAiMessage> {
-    let max_suggestions = request.max_suggestions.unwrap_or(6).min(12);
-    let cue_text = request
-        .transcript
+    let max_suggestions = request.max_suggestions.unwrap_or(6);
+    let cue_text = cues
         .iter()
-        .take(500)
         .map(|cue| {
             format!(
                 "[{:.2}-{:.2}] {}",
@@ -864,6 +1080,11 @@ fn build_transcript_intelligence_messages(
         .as_deref()
         .unwrap_or(&[])
         .iter()
+        .filter(|clip| {
+            clip.start_seconds < cues.last().unwrap().end_seconds
+                && clip.end_seconds > cues[0].start_seconds
+        })
+        .take(100)
         .map(|clip| format!("[{:.2}-{:.2}]", clip.start_seconds, clip.end_seconds))
         .collect::<Vec<_>>()
         .join(", ");
@@ -871,7 +1092,7 @@ fn build_transcript_intelligence_messages(
     vec![
         CloudAiMessage {
             role: CloudAiMessageRole::System,
-            content: "You are TV7 Engine. Return only valid JSON with a top-level clips array. Each clip must include title, start_seconds, end_seconds, reason, and score from 0 to 1. Do not include markdown.".to_string(),
+            content: "You are TV7 Engine. Return only valid JSON with a top-level clips array. Each clip must include title, start_seconds, end_seconds, reason, and a relative editorial score from 0 to 1 (not a viral probability). Use only the supplied timestamped cues; stay within their time bounds. Do not include markdown. Example JSON: {\"clips\":[{\"title\":\"Useful moment\",\"start_seconds\":1.0,\"end_seconds\":7.0,\"reason\":\"Complete spoken thought\",\"score\":0.8}]}".to_string(),
         },
         CloudAiMessage {
             role: CloudAiMessageRole::User,
@@ -884,23 +1105,6 @@ fn build_transcript_intelligence_messages(
             ),
         },
     ]
-}
-
-fn validate_ai_clip_suggestions(clips: &[AiClipSuggestion]) -> Result<(), CloudAiError> {
-    for clip in clips {
-        if clip.title.trim().is_empty()
-            || clip.reason.trim().is_empty()
-            || clip.start_seconds < 0.0
-            || clip.end_seconds <= clip.start_seconds
-            || !(0.0..=1.0).contains(&clip.score)
-        {
-            return Err(CloudAiError {
-                code: CloudAiErrorCode::ProviderUnavailable,
-                message: "cloud AI returned invalid clip suggestion fields".to_string(),
-            });
-        }
-    }
-    Ok(())
 }
 
 fn default_bearer_token_type() -> String {
@@ -963,6 +1167,16 @@ struct ExportAsset {
 #[derive(Deserialize)]
 struct SourcePreviewQuery {
     path: String,
+}
+
+#[derive(Deserialize)]
+struct TranscriptCuesQuery {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct TranscriptCuesResponse {
+    cues: Vec<engine_core::TimedTranscriptCue>,
 }
 
 const EXPORT_TTL: Duration = Duration::from_secs(60 * 60);
@@ -1303,7 +1517,7 @@ fn build_router_with_auth(state: AppState, api_token: Option<String>) -> Router 
         .route("/v1/ai/cloud-debug", post(debug_cloud_ai))
         .route(
             "/v1/ai/transcript-intelligence",
-            post(transcript_intelligence),
+            post(transcript_intelligence).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
         .route("/v1/media/probe", post(probe_media))
         .route("/v1/media/thumbnail", post(generate_thumbnail))
@@ -1311,6 +1525,7 @@ fn build_router_with_auth(state: AppState, api_token: Option<String>) -> Router 
         .route("/v1/media/source", get(preview_source_media))
         .route("/v1/media/assets/:id", get(export_rendered_asset))
         .route("/v1/transcripts/candidates", post(transcript_candidates))
+        .route("/v1/transcripts/cues", get(get_transcript_cues))
         .route(
             "/v1/transcripts/import",
             post(import_transcript).layer(DefaultBodyLimit::max(6 * 1024 * 1024)),
@@ -1413,6 +1628,7 @@ async fn debug_cloud_ai(
         model: None,
         temperature: Some(0.0),
         max_tokens: Some(8),
+        response_format: None,
     };
     match state.cloud_ai_executor.execute(&token, &request).await {
         Ok(_) => Ok(Json(CloudAiDebugResponse {
@@ -1786,6 +2002,30 @@ async fn transcript_candidates(
             )
         })??;
     Ok(Json(response))
+}
+
+async fn get_transcript_cues(
+    State(state): State<AppState>,
+    Query(query): Query<TranscriptCuesQuery>,
+) -> Result<Json<TranscriptCuesResponse>, ApiError> {
+    let path = validate_engine_asset_file(&state, &query.path)?;
+    let cues = tokio::task::spawn_blocking(move || read_vtt_cues(&path))
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "TRANSCRIPT_READ_FAILED",
+                error.to_string(),
+            )
+        })??;
+    if cues.len() > 10_000 || cues.iter().any(|cue| cue.text.len() > 4_000) {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "AI_CONTEXT_TOO_LARGE",
+            "transcript exceeds AI cue limits",
+        ));
+    }
+    Ok(Json(TranscriptCuesResponse { cues }))
 }
 
 fn validate_engine_asset_file(state: &AppState, path: &str) -> Result<PathBuf, ApiError> {
@@ -2923,7 +3163,7 @@ mod tests {
                         Ok(CloudAiExecuteResponse {
                             provider: "deepseek".to_string(),
                             model: "deepseek-chat".to_string(),
-                            content: r#"{"clips":[{"title":"Strong opening","start_seconds":1.0,"end_seconds":31.0,"reason":"Clear hook and useful standalone segment.","score":0.91}]}"#.to_string(),
+                            content: r#"{"clips":[{"title":"Strong opening","start_seconds":1.0,"end_seconds":7.0,"reason":"Clear hook and useful standalone segment.","score":0.91}]}"#.to_string(),
                             usage: CloudAiUsage {
                                 credits_charged: 1,
                                 credits_remaining: 9,
@@ -3763,6 +4003,7 @@ mod tests {
             "/v1/transcripts/download",
             "/v1/transcripts/generate",
             "/v1/transcripts/candidates",
+            "/v1/transcripts/cues",
             "/v1/transcripts/import",
             "/v1/jobs/{id}",
             "/v1/jobs/{id}/logs",
@@ -4478,7 +4719,7 @@ mod tests {
         )
         .await;
         let (status, body) = request_json(
-            app,
+            app.clone(),
             "POST",
             "/v1/ai/transcript-intelligence",
             Some(
@@ -4496,7 +4737,29 @@ mod tests {
         let calls = cloud.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "delegated-token");
+        assert_eq!(calls[0].1.response_format.as_deref(), Some("json_object"));
         assert!(calls[0].1.messages[1].content.contains("main insight"));
+
+        let long_cues: Vec<_> = (0..501)
+            .map(|index| {
+                serde_json::json!({
+                    "start_seconds": index * 3,
+                    "end_seconds": index * 3 + 2,
+                    "text": format!("Spoken thought {index}"),
+                })
+            })
+            .collect();
+        let body = serde_json::json!({"transcript": long_cues, "clip_duration": "medium", "timeline_target": "entire_video", "max_suggestions": 2}).to_string();
+        let (status, body) =
+            request_json(app, "POST", "/v1/ai/transcript-intelligence", Some(&body)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let calls = cloud.calls();
+        assert!(calls.len() >= 3);
+        assert!(
+            calls.last().unwrap().1.messages[1]
+                .content
+                .contains("Spoken thought 500")
+        );
     }
 
     #[tokio::test]
@@ -4515,6 +4778,102 @@ mod tests {
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"], "AI_AUTH_REQUIRED");
+    }
+
+    #[test]
+    fn transcript_intelligence_chunks_cover_tail_and_bound_request_size() {
+        let cues: Vec<_> = (0..901)
+            .map(|index| TranscriptCue {
+                start_seconds: index as f64 * 2.0,
+                end_seconds: index as f64 * 2.0 + 1.5,
+                text: format!("Spoken cue number {index}"),
+            })
+            .collect();
+        let chunks = transcript_chunks(&cues).unwrap();
+        assert!(chunks.len() >= 3);
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).sum::<usize>(),
+            cues.len()
+        );
+        assert_eq!(chunks.last().unwrap().last().unwrap(), cues.last().unwrap());
+        assert!(chunks.iter().all(|chunk| chunk.len() <= AI_MAX_CHUNK_CUES));
+    }
+
+    #[test]
+    fn transcript_intelligence_rejects_hallucinated_and_silent_ranges() {
+        let cues = vec![TranscriptCue {
+            start_seconds: 10.0,
+            end_seconds: 17.0,
+            text: "A complete spoken thought.".into(),
+        }];
+        let clip = |start_seconds, end_seconds| AiClipSuggestion {
+            title: "Clip".into(),
+            start_seconds,
+            end_seconds,
+            reason: "Self-contained moment".into(),
+            score: 0.8,
+        };
+        assert!(valid_ai_clip(&clip(10.0, 17.0), &cues));
+        assert!(!valid_ai_clip(&clip(10.0, 40.0), &cues));
+        assert!(!valid_ai_clip(&clip(0.0, 10.0), &cues));
+        assert!(!valid_ai_clip(&clip(f64::NAN, 17.0), &cues));
+        assert!(range_overlap_fraction(10.0, 17.0, 12.0, 15.0) > 0.5);
+    }
+
+    #[test]
+    fn transcript_intelligence_accepts_one_wrapped_json_object() {
+        let json = r#"{"clips":[{"title":"A brace } in speech","start_seconds":1,"end_seconds":7,"reason":"Complete thought","score":0.8}]}"#;
+        let fenced = format!("```json\n{json}\n```");
+        let prose = format!("Here are the clips:\n{json}\nReady for review.");
+        for response in [json.to_string(), fenced, prose] {
+            let parsed = parse_ai_clip_envelope(&response).unwrap();
+            assert_eq!(parsed.clips[0].title, "A brace } in speech");
+        }
+    }
+
+    #[test]
+    fn transcript_intelligence_rejects_ambiguous_or_malformed_json() {
+        let json = r#"{"clips":[]}"#;
+        for response in [
+            format!("{json}\n{json}"),
+            format!("[{json}]"),
+            "```json\n{\"clips\": [}\n```".to_string(),
+            "Here is a partial object: {\"clips\":[]".to_string(),
+        ] {
+            assert!(parse_ai_clip_envelope(&response).is_err(), "{response}");
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_cues_endpoint_reads_only_engine_owned_vtt() {
+        let root = test_setup_context().asset_dir;
+        fs::create_dir_all(&root).unwrap();
+        let owned = root.join(format!("{}.vtt", Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("{}.vtt", Uuid::new_v4()));
+        let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\nA useful hook.\n";
+        fs::write(&owned, vtt).unwrap();
+        fs::write(&outside, vtt).unwrap();
+        let app = router_with_probe(Err(EngineError::Io("unused".into())));
+        let (status, body) = request_json(
+            app.clone(),
+            "GET",
+            &format!("/v1/transcripts/cues?path={}", owned.display()),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["cues"][0]["start_seconds"], 1.0);
+        assert_eq!(body["cues"][0]["text"], "A useful hook.");
+        let (status, _) = request_json(
+            app,
+            "GET",
+            &format!("/v1/transcripts/cues?path={}", outside.display()),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        fs::remove_file(owned).unwrap();
+        fs::remove_file(outside).unwrap();
     }
 
     #[tokio::test]
