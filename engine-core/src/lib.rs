@@ -1261,14 +1261,15 @@ impl TranscriptProvider for FfmpegMediaEngine {
             .to_string();
         let mut args = self.ytdlp_js_args();
         args.extend(vec![
-            "--write-auto-sub".to_string(),
-            "--sub-lang".to_string(),
+            "--write-subs".to_string(),
+            "--write-auto-subs".to_string(),
+            "--sub-langs".to_string(),
             language.clone(),
             "--sub-format".to_string(),
             "vtt".to_string(),
             "--skip-download".to_string(),
             "-o".to_string(),
-            output_base,
+            output_base.clone(),
             request.url.clone(),
         ]);
         self.run_checked(&self.yt_dlp_bin, &args)?;
@@ -1277,12 +1278,17 @@ impl TranscriptProvider for FfmpegMediaEngine {
             .into_iter()
             .filter(|path| !before.contains(path))
             .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("vtt"))
+            .filter(|path| path.to_string_lossy().starts_with(&output_base))
             .max_by_key(|path| {
                 fs::metadata(path)
                     .and_then(|metadata| metadata.modified())
                     .ok()
             })
-            .map(|path| path.to_string_lossy().to_string());
+            .map(|path| {
+                inspect_vtt(&path)?;
+                Ok(path.to_string_lossy().to_string())
+            })
+            .transpose()?;
 
         Ok(TranscriptDownloadResult {
             transcript_path,
@@ -1322,6 +1328,47 @@ impl TranscriptProvider for FfmpegMediaEngine {
 
         self.validate_source_path(whisper_model)?;
 
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let audio_path = output_path.parent().unwrap().join(format!(
+            "tv7-transcription-{}-{unique}.wav",
+            std::process::id()
+        ));
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&audio_path)
+            .map_err(|error| EngineError::Io(error.to_string()))?;
+        let temporary_audio = TemporaryAudio { path: audio_path };
+        self.run_checked(
+            &self.ffmpeg_bin,
+            &[
+                "-v".to_string(),
+                "error".to_string(),
+                "-y".to_string(),
+                "-i".to_string(),
+                request.media_path.clone(),
+                "-vn".to_string(),
+                "-ac".to_string(),
+                "1".to_string(),
+                "-ar".to_string(),
+                "16000".to_string(),
+                "-c:a".to_string(),
+                "pcm_s16le".to_string(),
+                temporary_audio.path.to_string_lossy().to_string(),
+            ],
+        )?;
+        if fs::metadata(&temporary_audio.path)
+            .map(|metadata| metadata.len() <= 44)
+            .unwrap_or(true)
+        {
+            return Err(EngineError::OutputInvalid(
+                "audio extraction produced no usable WAV".into(),
+            ));
+        }
+
         let language = request.language.clone().unwrap_or_else(|| "en".to_string());
         let output_base = request
             .output_path
@@ -1332,7 +1379,7 @@ impl TranscriptProvider for FfmpegMediaEngine {
             "-m".to_string(),
             whisper_model.to_string_lossy().to_string(),
             "-f".to_string(),
-            request.media_path.clone(),
+            temporary_audio.path.to_string_lossy().to_string(),
             "-l".to_string(),
             language.clone(),
             "-ovtt".to_string(),
@@ -1347,6 +1394,8 @@ impl TranscriptProvider for FfmpegMediaEngine {
                 output_path.display()
             )));
         }
+
+        inspect_vtt(output_path)?;
 
         Ok(TranscriptGenerateResult {
             transcript_path: request.output_path.clone(),
@@ -1499,6 +1548,16 @@ impl ClipRenderer for FfmpegMediaEngine {
             duration_seconds: request.end_seconds - request.start_seconds,
             media_id: None,
         })
+    }
+}
+
+struct TemporaryAudio {
+    path: PathBuf,
+}
+
+impl Drop for TemporaryAudio {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -2302,12 +2361,14 @@ mod tests {
     #[derive(Debug)]
     struct TranscriptExecutor {
         calls: Mutex<Vec<(String, Vec<String>)>>,
+        fail_stage: Option<&'static str>,
     }
 
     impl TranscriptExecutor {
         fn new() -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                fail_stage: None,
             }
         }
 
@@ -2325,13 +2386,60 @@ mod tests {
                 .lock()
                 .expect("mock lock should not be poisoned")
                 .push((executable.to_string(), args.to_vec()));
+            if self.fail_stage == Some(executable) {
+                return Err(EngineError::CommandFailed {
+                    command: executable.to_string(),
+                    message: "fixture failure".to_string(),
+                });
+            }
+            if executable == "ffmpeg" {
+                fs::write(args.last().unwrap(), vec![1u8; 64])
+                    .map_err(|error| EngineError::Io(error.to_string()))?;
+                return Ok(ToolOutput {
+                    status_success: true,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            }
+            let input = args.windows(2).find(|pair| pair[0] == "-f").unwrap()[1].clone();
+            assert!(
+                Path::new(&input).is_file(),
+                "Whisper must receive extracted WAV"
+            );
             let output_base = args
                 .windows(2)
                 .find(|pair| pair[0] == "-of")
                 .map(|pair| pair[1].clone())
                 .expect("transcript command should include -of");
-            fs::write(format!("{output_base}.vtt"), "WEBVTT\n\n")
+            fs::write(
+                format!("{output_base}.vtt"),
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n",
+            )
+            .map_err(|error| EngineError::Io(error.to_string()))?;
+            Ok(ToolOutput {
+                status_success: true,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    struct CaptionExecutor {
+        calls: Mutex<Vec<Vec<String>>>,
+        produce_caption: bool,
+    }
+
+    impl CommandExecutor for CaptionExecutor {
+        fn run(&self, _executable: &str, args: &[String]) -> Result<ToolOutput, EngineError> {
+            self.calls.lock().unwrap().push(args.to_vec());
+            if self.produce_caption {
+                let base = args.windows(2).find(|pair| pair[0] == "-o").unwrap()[1].clone();
+                fs::write(
+                    format!("{base}.en.vtt"),
+                    "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nCaption\n",
+                )
                 .map_err(|error| EngineError::Io(error.to_string()))?;
+            }
             Ok(ToolOutput {
                 status_success: true,
                 stdout: Vec::new(),
@@ -3043,14 +3151,93 @@ mod tests {
         assert_eq!(result.format, "vtt");
         assert_eq!(result.language, "en");
         let calls = executor.calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "whisper-cli");
-        assert!(calls[0].1.contains(&"-ovtt".to_string()));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "ffmpeg");
+        assert!(calls[0].1.windows(2).any(|pair| pair == ["-ac", "1"]));
+        assert!(calls[0].1.windows(2).any(|pair| pair == ["-ar", "16000"]));
         assert!(
             calls[0]
                 .1
+                .windows(2)
+                .any(|pair| pair == ["-c:a", "pcm_s16le"])
+        );
+        assert_eq!(calls[1].0, "whisper-cli");
+        assert!(calls[1].1.contains(&"-ovtt".to_string()));
+        assert!(
+            calls[1]
+                .1
                 .contains(&model_path.to_string_lossy().to_string())
         );
+        let audio_path = calls[0].1.last().unwrap();
+        assert!(audio_path.ends_with(".wav"));
+        assert!(calls[1].1.contains(audio_path));
+        assert!(
+            !Path::new(audio_path).exists(),
+            "temporary WAV must be removed"
+        );
+    }
+
+    #[test]
+    fn generated_transcript_cleans_audio_after_whisper_failure() {
+        let root = TestTempDir::new("tv7-transcript-failure");
+        let media_path = root.path().join("video.mp4");
+        let model_path = root.path().join("ggml-base.bin");
+        let output_path = root.path().join("video.vtt");
+        fs::write(&media_path, b"video").unwrap();
+        fs::write(&model_path, b"model").unwrap();
+        let executor = Arc::new(TranscriptExecutor {
+            calls: Mutex::new(Vec::new()),
+            fail_stage: Some("whisper-cli"),
+        });
+        let engine = FfmpegMediaEngine::with_all_bins_transcription_and_executor(
+            "ffmpeg",
+            "ffprobe",
+            "yt-dlp",
+            Some("whisper-cli".into()),
+            Some(model_path),
+            executor.clone(),
+        );
+        assert!(
+            engine
+                .generate_transcript(&TranscriptGenerateRequest {
+                    media_path: media_path.to_string_lossy().to_string(),
+                    output_path: output_path.to_string_lossy().to_string(),
+                    language: Some("en".into()),
+                })
+                .is_err()
+        );
+        let audio_path = executor.calls()[0].1.last().unwrap().clone();
+        assert!(!Path::new(&audio_path).exists());
+        assert!(!output_path.exists());
+    }
+
+    #[test]
+    fn caption_download_prefers_available_subtitles_and_reports_absence() {
+        for produce_caption in [true, false] {
+            let root = TestTempDir::new("tv7-caption-download");
+            let output = root.path().join("caption.vtt");
+            let executor = Arc::new(CaptionExecutor {
+                calls: Mutex::new(Vec::new()),
+                produce_caption,
+            });
+            let engine = FfmpegMediaEngine::with_executor("ffmpeg", "ffprobe", executor.clone());
+            let result = engine
+                .download_transcript(&TranscriptDownloadRequest {
+                    url: "https://www.youtube.com/watch?v=abcdefghijk".to_string(),
+                    output_path: output.to_string_lossy().to_string(),
+                    language: Some("en".to_string()),
+                })
+                .unwrap();
+            assert_eq!(result.transcript_path.is_some(), produce_caption);
+            if let Some(path) = result.transcript_path {
+                assert_eq!(inspect_vtt(Path::new(&path)).unwrap().cue_count, 1);
+            }
+            let calls = executor.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0].contains(&"--write-subs".to_string()));
+            assert!(calls[0].contains(&"--write-auto-subs".to_string()));
+            assert!(calls[0].contains(&"--sub-langs".to_string()));
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Multipart, Request, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Query, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -960,6 +960,11 @@ struct ExportAsset {
     created: Instant,
 }
 
+#[derive(Deserialize)]
+struct SourcePreviewQuery {
+    path: String,
+}
+
 const EXPORT_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_EXPORT_ASSETS: usize = 100;
 const MAX_EXPORT_BYTES: u64 = 1024 * 1024 * 1024;
@@ -1303,6 +1308,7 @@ fn build_router_with_auth(state: AppState, api_token: Option<String>) -> Router 
         .route("/v1/media/probe", post(probe_media))
         .route("/v1/media/thumbnail", post(generate_thumbnail))
         .route("/v1/media/render-clip", post(render_clip))
+        .route("/v1/media/source", get(preview_source_media))
         .route("/v1/media/assets/:id", get(export_rendered_asset))
         .route("/v1/transcripts/candidates", post(transcript_candidates))
         .route(
@@ -1629,6 +1635,64 @@ async fn export_rendered_asset(
             "rendered asset not found",
         )
     })?;
+    stream_video_file(
+        path,
+        headers,
+        "video/mp4",
+        Some("attachment; filename=\"tv7-clip.mp4\""),
+    )
+    .await
+}
+
+async fn preview_source_media(
+    State(state): State<AppState>,
+    Query(query): Query<SourcePreviewQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, ApiError> {
+    let root = fs::canonicalize(&state.setup_context.asset_dir).map_err(|_| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "SOURCE_NOT_FOUND",
+            "source media not found",
+        )
+    })?;
+    let path = fs::canonicalize(&query.path).map_err(|_| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "SOURCE_NOT_FOUND",
+            "source media not found",
+        )
+    })?;
+    if !path.starts_with(root) || !path.is_file() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "SOURCE_NOT_FOUND",
+            "source media not found",
+        ));
+    }
+    let content_type = match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("mp4") || ext.eq_ignore_ascii_case("m4v") => {
+            "video/mp4"
+        }
+        Some(ext) if ext.eq_ignore_ascii_case("webm") => "video/webm",
+        Some(ext) if ext.eq_ignore_ascii_case("mov") => "video/quicktime",
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "UNSUPPORTED_PREVIEW",
+                "source preview requires an MP4, M4V, WebM, or MOV file",
+            ));
+        }
+    };
+    stream_video_file(path, headers, content_type, None).await
+}
+
+async fn stream_video_file(
+    path: PathBuf,
+    headers: axum::http::HeaderMap,
+    content_type: &'static str,
+    content_disposition: Option<&'static str>,
+) -> Result<Response, ApiError> {
     let size = tokio::fs::metadata(&path)
         .await
         .map_err(|_| {
@@ -1691,13 +1755,12 @@ async fn export_rendered_asset(
         } else {
             StatusCode::OK
         })
-        .header(header::CONTENT_TYPE, "video/mp4")
+        .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, length.to_string())
-        .header(header::ACCEPT_RANGES, "bytes")
-        .header(
-            header::CONTENT_DISPOSITION,
-            "attachment; filename=\"tv7-clip.mp4\"",
-        );
+        .header(header::ACCEPT_RANGES, "bytes");
+    if let Some(disposition) = content_disposition {
+        response = response.header(header::CONTENT_DISPOSITION, disposition);
+    }
     if range.is_some() {
         response = response.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"));
     }
@@ -3547,6 +3610,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_preview_requires_token_and_engine_owned_video() {
+        let root = std::env::temp_dir().join(format!("tv7-source-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.mp4");
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("outside-{}.mp4", Uuid::new_v4()));
+        fs::write(&source, b"0123456789").unwrap();
+        fs::write(&outside, b"outside").unwrap();
+        let mut context = test_setup_context();
+        context.asset_dir = root.clone();
+        let token = "t".repeat(48);
+        let app = build_router_with_auth(
+            mock_app_state(Err(EngineError::Io("unused".into())), context),
+            Some(token.clone()),
+        );
+        let uri = format!("/v1/media/source?path={}", source.display());
+        let unauthorized = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let partial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::RANGE, "bytes=2-4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(partial.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(partial.headers()[header::CONTENT_TYPE], "video/mp4");
+        assert_eq!(partial.headers()[header::CONTENT_RANGE], "bytes 2-4/10");
+        assert_eq!(
+            to_bytes(partial.into_body(), 100).await.unwrap().as_ref(),
+            b"234"
+        );
+        let outside_uri = format!("/v1/media/source?path={}", outside.display());
+        let rejected = app
+            .oneshot(
+                Request::builder()
+                    .uri(outside_uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::NOT_FOUND);
+        fs::remove_file(outside).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn rendered_asset_export_rejects_outside_and_unknown_ids() {
         let root = std::env::temp_dir().join(format!("tv7-export-root-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -3631,6 +3754,7 @@ mod tests {
             "/v1/media/probe",
             "/v1/media/thumbnail",
             "/v1/media/render-clip",
+            "/v1/media/source",
             "/v1/media/assets/{id}",
             "/v1/ingest/url",
             "/v1/channels/discover",
