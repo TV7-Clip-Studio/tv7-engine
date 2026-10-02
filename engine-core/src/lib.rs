@@ -111,9 +111,28 @@ pub fn generate_candidates(request: &CandidateRequest) -> Result<CandidateRespon
             index += 1;
         }
         let group = &cues[first..index];
+        let Some(first_speech) = group.iter().position(|cue| !is_non_speech_cue(&cue.text)) else {
+            continue;
+        };
+        let last_speech = group
+            .iter()
+            .rposition(|cue| !is_non_speech_cue(&cue.text))
+            .unwrap();
+        let group = &group[first_speech..=last_speech];
+        let start = group[0].start;
+        let end = group.last().unwrap().end.min(start + max_duration);
+        let spoken_words = group
+            .iter()
+            .filter(|cue| !is_non_speech_cue(&cue.text))
+            .flat_map(|cue| cue.text.split_whitespace())
+            .filter(|word| word.chars().any(char::is_alphanumeric))
+            .count();
+        if end - start < 3.0 || (end - start < 8.0 && spoken_words < 8) {
+            continue;
+        }
         windows.push(TranscriptCandidate {
             start_seconds: start,
-            end_seconds: group.last().unwrap().end.min(start + max_duration),
+            end_seconds: end,
             text: group
                 .iter()
                 .map(|cue| cue.text.as_str())
@@ -136,6 +155,11 @@ pub fn generate_candidates(request: &CandidateRequest) -> Result<CandidateRespon
             .collect()
     };
     Ok(CandidateResponse { candidates })
+}
+
+fn is_non_speech_cue(text: &str) -> bool {
+    let text = text.trim();
+    (text.starts_with('[') && text.ends_with(']')) || (text.starts_with('(') && text.ends_with(')'))
 }
 
 fn read_vtt(path: &Path) -> Result<Vec<VttCue>, EngineError> {
@@ -1369,7 +1393,10 @@ impl TranscriptProvider for FfmpegMediaEngine {
             ));
         }
 
-        let language = request.language.clone().unwrap_or_else(|| "en".to_string());
+        let language = request
+            .language
+            .clone()
+            .unwrap_or_else(|| "auto".to_string());
         let output_base = request
             .output_path
             .strip_suffix(".vtt")
@@ -3104,6 +3131,40 @@ mod tests {
     }
 
     #[test]
+    fn candidates_skip_sound_effects_and_weak_short_windows() {
+        let root = TestTempDir::new("tv7-speech-candidates");
+        let path = root.path().join("transcript.vtt");
+        fs::write(&path, "WEBVTT\n\n00:00:00.000 --> 00:00:07.000\n[Music]\n\n00:00:07.000 --> 00:00:18.000\nA real spoken opening with enough context to review.\n\n00:01:00.000 --> 00:01:04.000\nThis short spoken sentence still has enough meaningful words.\n\n00:02:00.000 --> 00:02:03.000\n[XBOX SOUND]\n\n00:03:00.000 --> 00:03:04.000\nHi.\n").unwrap();
+        let response = generate_candidates(&CandidateRequest {
+            transcript_path: path.to_string_lossy().to_string(),
+            max_candidates: Some(5),
+            max_duration_seconds: Some(45.0),
+        })
+        .unwrap();
+        assert_eq!(response.candidates.len(), 2);
+        assert_eq!(
+            (
+                response.candidates[0].start_seconds,
+                response.candidates[0].end_seconds
+            ),
+            (7.0, 18.0)
+        );
+        assert_eq!(
+            (
+                response.candidates[1].start_seconds,
+                response.candidates[1].end_seconds
+            ),
+            (60.0, 64.0)
+        );
+        assert!(
+            response
+                .candidates
+                .iter()
+                .all(|candidate| candidate.end_seconds - candidate.start_seconds <= 45.0)
+        );
+    }
+
+    #[test]
     fn subtitle_overlay_is_clip_relative_and_cleans_up() {
         let root = TestTempDir::new("tv7-subtitle-overlay");
         let path = root.path().join("transcript.vtt");
@@ -3209,6 +3270,38 @@ mod tests {
         let audio_path = executor.calls()[0].1.last().unwrap().clone();
         assert!(!Path::new(&audio_path).exists());
         assert!(!output_path.exists());
+    }
+
+    #[test]
+    fn generated_transcript_defaults_to_whisper_language_detection() {
+        let root = TestTempDir::new("tv7-transcript-auto-language");
+        let media_path = root.path().join("video.mp4");
+        let model_path = root.path().join("ggml-base.bin");
+        let output_path = root.path().join("video.vtt");
+        fs::write(&media_path, b"video").unwrap();
+        fs::write(&model_path, b"model").unwrap();
+        let executor = Arc::new(TranscriptExecutor::new());
+        let engine = FfmpegMediaEngine::with_all_bins_transcription_and_executor(
+            "ffmpeg",
+            "ffprobe",
+            "yt-dlp",
+            Some("whisper-cli".into()),
+            Some(model_path),
+            executor.clone(),
+        );
+        let result = engine
+            .generate_transcript(&TranscriptGenerateRequest {
+                media_path: media_path.to_string_lossy().to_string(),
+                output_path: output_path.to_string_lossy().to_string(),
+                language: None,
+            })
+            .unwrap();
+        assert_eq!(result.language, "auto");
+        let calls = executor.calls();
+        assert_eq!(
+            calls[1].1.windows(2).find(|pair| pair[0] == "-l").unwrap()[1],
+            "auto"
+        );
     }
 
     #[test]
