@@ -42,7 +42,7 @@ make dev
 
 ## Selected YouTube Channel Flow
 
-- `POST /v1/channels/discover` with `{"url":"https://www.youtube.com/@creator/videos","cursor":0}` lists up to 25 videos. `next_cursor` can be sent for another page; discovery stops at 500 entries and never downloads media.
+- `POST /v1/channels/discover` with `{"url":"https://www.youtube.com/@creator/videos","cursor":0}` lists up to 25 videos. `next_cursor` can be sent for another page; discovery stops at 500 entries and never downloads media. Selected downloads prefer direct HTTPS AVC/AAC at up to 1080p, then other direct HTTPS formats, to avoid unreliable HLS choices.
 - A channel handle URL such as `https://www.youtube.com/@creator` is normalized to its `/videos` tab. A first page with no videos is reported as an error so the UI can show yt-dlp's diagnostic instead of treating it as a successful empty channel.
 - `POST /v1/ingest/selected` with `{"videos":[{"id":"abcdefghijk","url":"https://www.youtube.com/watch?v=abcdefghijk"}]}` starts one job per selected video and returns `jobs` with `video_id` and `job_id`. The optional `output_dir` must be an existing directory inside Engine's asset directory. Selection is capped at 25 videos per request.
 - `POST /v1/ingest/url` with `{"url":"https://www.youtube.com/watch?v=abcdefghijk"}` starts a single download job. Its optional `output_dir` follows the same Engine asset directory restriction.

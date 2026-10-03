@@ -26,7 +26,6 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -1149,7 +1148,6 @@ enum JobStatus {
 
 #[derive(Clone, Default)]
 struct JobStore {
-    next_id: Arc<AtomicU64>,
     jobs: Arc<Mutex<HashMap<String, EngineJob>>>,
 }
 
@@ -1226,7 +1224,7 @@ const MAX_JOBS: usize = 1_000;
 impl JobStore {
     fn create(&self, kind: JobKind) -> EngineJob {
         self.cleanup_expired();
-        let id = format!("job_{}", self.next_id.fetch_add(1, Ordering::SeqCst) + 1);
+        let id = format!("job_{}", Uuid::new_v4());
         let job = EngineJob {
             id: id.clone(),
             kind,
@@ -2513,13 +2511,16 @@ async fn import_transcript(
 fn spawn_url_ingest(state: &AppState, mut payload: UrlIngestRequest) -> EngineJob {
     let job = state.jobs.create(JobKind::UrlIngest);
     let job_id = job.id.clone();
+    // Job IDs restart with the Engine process; media filenames must not.
+    let output_prefix = format!("{job_id}-{}-", Uuid::new_v4());
     if let Some(template) = payload.output_template.as_mut() {
-        *template = format!("{job_id}-{template}");
+        *template = format!("{output_prefix}{template}");
     }
     let output_dir = payload.output_dir.clone();
     let jobs = state.jobs.clone();
     let ingestor = state.url_ingestor.clone();
     let task_jobs = jobs.clone();
+    let cleanup_prefix = output_prefix;
     tokio::spawn(async move {
         let Ok(_permit) = download_semaphore().acquire_owned().await else {
             return;
@@ -2547,7 +2548,7 @@ fn spawn_url_ingest(state: &AppState, mut payload: UrlIngestRequest) -> EngineJo
                                 if entry
                                     .file_name()
                                     .to_string_lossy()
-                                    .starts_with(&format!("{job_id}-"))
+                                    .starts_with(&cleanup_prefix)
                                     && entry.path().is_file()
                                 {
                                     let _ = fs::remove_file(entry.path());
@@ -3443,6 +3444,13 @@ mod tests {
         assert_ne!(jobs[0]["job_id"], jobs[1]["job_id"]);
     }
 
+    #[test]
+    fn job_ids_do_not_repeat_after_store_restart() {
+        let first = JobStore::default().create(JobKind::UrlIngest).id;
+        let second = JobStore::default().create(JobKind::UrlIngest).id;
+        assert_ne!(first, second);
+    }
+
     #[tokio::test]
     async fn candidate_and_subtitle_routes_restrict_vtt_to_engine_assets() {
         let unique = SystemTime::now()
@@ -4130,6 +4138,7 @@ mod tests {
             ),
         ];
 
+        let mut contract_job_id = None;
         for (contract_method, contract_path, request_method, request_uri, request_body) in cases {
             let request_app = if contract_path == "/v1/transcripts/generate" {
                 router_with_probe_and_setup_context(
@@ -4148,6 +4157,9 @@ mod tests {
             };
             let (status, body) =
                 request_json(request_app, request_method, request_uri, request_body).await;
+            if contract_path == "/v1/ingest/url" {
+                contract_job_id = body["job"]["id"].as_str().map(str::to_string);
+            }
             assert!(
                 success_statuses_for(&openapi, contract_path, contract_method)
                     .contains(&status.as_u16()),
@@ -4155,23 +4167,30 @@ mod tests {
             );
         }
 
+        let job_id = contract_job_id.expect("ingest route should create a job");
         for (contract_method, contract_path, request_method, request_uri) in [
             (
                 "delete",
                 "/v1/ai/cloud-token",
                 "DELETE",
-                "/v1/ai/cloud-token",
+                "/v1/ai/cloud-token".to_string(),
             ),
-            ("get", "/v1/jobs/{id}", "GET", "/v1/jobs/job_1"),
-            ("get", "/v1/jobs/{id}/logs", "GET", "/v1/jobs/job_1/logs"),
+            ("get", "/v1/jobs/{id}", "GET", format!("/v1/jobs/{job_id}")),
+            (
+                "get",
+                "/v1/jobs/{id}/logs",
+                "GET",
+                format!("/v1/jobs/{job_id}/logs"),
+            ),
             (
                 "post",
                 "/v1/jobs/{id}/cancel",
                 "POST",
-                "/v1/jobs/job_1/cancel",
+                format!("/v1/jobs/{job_id}/cancel"),
             ),
         ] {
-            let (status, body) = request_json(app.clone(), request_method, request_uri, None).await;
+            let (status, body) =
+                request_json(app.clone(), request_method, &request_uri, None).await;
             assert!(
                 success_statuses_for(&openapi, contract_path, contract_method)
                     .contains(&status.as_u16()),
@@ -4351,7 +4370,8 @@ mod tests {
             );
         }
 
-        let (_, logs) = request_json(app, "GET", "/v1/jobs/job_1/logs", None).await;
+        let job_id = selected["jobs"][0]["job_id"].as_str().unwrap();
+        let (_, logs) = request_json(app, "GET", &format!("/v1/jobs/{job_id}/logs"), None).await;
         for key in ["job_id", "logs"] {
             assert!(logs.get(key).is_some(), "missing logs.{key}");
         }
@@ -5119,10 +5139,16 @@ mod tests {
             .expect("ingest request should complete");
         assert_eq!(create_response.status(), StatusCode::ACCEPTED);
 
+        let created = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&created).unwrap();
+        let job_id = created["job"]["id"].as_str().unwrap();
+
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v1/jobs/job_1/logs")
+                    .uri(format!("/v1/jobs/{job_id}/logs"))
                     .method("GET")
                     .body(Body::empty())
                     .expect("request should be valid"),
@@ -5188,10 +5214,16 @@ mod tests {
             .expect("transcript request should complete");
         assert_eq!(create_response.status(), StatusCode::ACCEPTED);
 
+        let created = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&created).unwrap();
+        let job_id = created["job"]["id"].as_str().unwrap();
+
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v1/jobs/job_1/cancel")
+                    .uri(format!("/v1/jobs/{job_id}/cancel"))
                     .method("POST")
                     .body(Body::empty())
                     .expect("request should be valid"),
@@ -5256,13 +5288,19 @@ mod tests {
             .expect("ingest request should complete");
         assert_eq!(create_response.status(), StatusCode::ACCEPTED);
 
+        let created = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&created).unwrap();
+        let job_id = created["job"]["id"].as_str().unwrap();
+
         let mut job_body = serde_json::Value::Null;
         for _ in 0..20 {
             let response = app
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri("/v1/jobs/job_1")
+                        .uri(format!("/v1/jobs/{job_id}"))
                         .method("GET")
                         .body(Body::empty())
                         .expect("request should be valid"),

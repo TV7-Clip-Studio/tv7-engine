@@ -5,7 +5,7 @@ use std::fs;
 use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -212,6 +212,7 @@ fn read_vtt(path: &Path) -> Result<Vec<VttCue>, EngineError> {
     if !normalized.starts_with("WEBVTT") {
         return Err(EngineError::OutputInvalid("expected WEBVTT header".into()));
     }
+    let rolling_captions = normalized.contains("<00:");
     let mut cues = Vec::new();
     for block in normalized.split("\n\n").skip(1) {
         let mut lines = block.lines();
@@ -231,8 +232,26 @@ fn read_vtt(path: &Path) -> Result<Vec<VttCue>, EngineError> {
                 "VTT cue end must exceed start".into(),
             ));
         }
-        let text = lines.collect::<Vec<_>>().join(" ").trim().to_string();
+        // YouTube auto captions carry karaoke timestamps and repeat the prior
+        // line while the next line is spoken. Keep the newest visible line.
+        let raw_lines = lines.collect::<Vec<_>>();
+        let cleaned = raw_lines
+            .iter()
+            .map(|line| clean_vtt_line(line))
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        let text = if rolling_captions {
+            cleaned.last().cloned().unwrap_or_default()
+        } else {
+            cleaned.join(" ")
+        };
         if text.is_empty() {
+            continue;
+        }
+        if cues
+            .last()
+            .is_some_and(|previous: &VttCue| previous.text == text)
+        {
             continue;
         }
         if cues.len() >= 20_000 {
@@ -247,6 +266,26 @@ fn read_vtt(path: &Path) -> Result<Vec<VttCue>, EngineError> {
         ));
     }
     Ok(cues)
+}
+
+fn clean_vtt_line(line: &str) -> String {
+    let mut result = String::new();
+    let mut inside_tag = false;
+    for ch in line.chars() {
+        match ch {
+            '<' => inside_tag = true,
+            '>' if inside_tag => inside_tag = false,
+            _ if !inside_tag => result.push(ch),
+            _ => {}
+        }
+    }
+    result
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_vtt_time(value: &str) -> Result<f64, EngineError> {
@@ -794,6 +833,7 @@ pub struct FfmpegMediaEngine {
     whisper_bin: Option<String>,
     whisper_model: Option<PathBuf>,
     executor: Arc<dyn CommandExecutor>,
+    yt_dlp_diagnostic: Arc<OnceLock<ToolDiagnostic>>,
 }
 
 impl fmt::Debug for FfmpegMediaEngine {
@@ -825,6 +865,7 @@ impl FfmpegMediaEngine {
             whisper_bin: None,
             whisper_model: None,
             executor: Arc::new(ProcessCommandExecutor),
+            yt_dlp_diagnostic: Arc::new(OnceLock::new()),
         }
     }
 
@@ -837,6 +878,7 @@ impl FfmpegMediaEngine {
             whisper_bin: None,
             whisper_model: None,
             executor: Arc::new(ProcessCommandExecutor),
+            yt_dlp_diagnostic: Arc::new(OnceLock::new()),
         }
     }
 
@@ -853,6 +895,7 @@ impl FfmpegMediaEngine {
             whisper_bin: None,
             whisper_model: None,
             executor: Arc::new(ProcessCommandExecutor),
+            yt_dlp_diagnostic: Arc::new(OnceLock::new()),
         }
     }
 
@@ -871,6 +914,7 @@ impl FfmpegMediaEngine {
             whisper_bin,
             whisper_model,
             executor: Arc::new(ProcessCommandExecutor),
+            yt_dlp_diagnostic: Arc::new(OnceLock::new()),
         }
     }
 
@@ -887,6 +931,7 @@ impl FfmpegMediaEngine {
             whisper_bin: None,
             whisper_model: None,
             executor,
+            yt_dlp_diagnostic: Arc::new(OnceLock::new()),
         }
     }
 
@@ -904,6 +949,7 @@ impl FfmpegMediaEngine {
             whisper_bin: None,
             whisper_model: None,
             executor,
+            yt_dlp_diagnostic: Arc::new(OnceLock::new()),
         }
     }
 
@@ -923,6 +969,7 @@ impl FfmpegMediaEngine {
             whisper_bin,
             whisper_model,
             executor,
+            yt_dlp_diagnostic: Arc::new(OnceLock::new()),
         }
     }
 
@@ -1086,7 +1133,7 @@ fn tool_version_args(name: &str) -> Vec<String> {
         .and_then(|value| value.to_str())
         .unwrap_or(name)
         .to_ascii_lowercase();
-    if executable_name == "yt-dlp" || executable_name == "yt_dlp" {
+    if executable_name.starts_with("yt-dlp") || executable_name.starts_with("yt_dlp") {
         vec!["--version".to_string()]
     } else {
         vec!["-version".to_string()]
@@ -1191,6 +1238,11 @@ impl UrlIngestor for FfmpegMediaEngine {
         let output_pattern = output_dir.join(template);
         let mut download_args = self.ytdlp_js_args();
         download_args.extend(vec![
+            "--format".to_string(),
+            "bv*[vcodec^=avc1][height<=1080][protocol=https]+ba[acodec^=mp4a][protocol=https]/bv*[height<=1080][protocol=https]+ba[protocol=https]/b[height<=1080][protocol=https]".to_string(),
+            "--merge-output-format".to_string(),
+            "mp4".to_string(),
+            "--no-playlist".to_string(),
             "-o".to_string(),
             output_pattern.to_string_lossy().to_string(),
             request.url.clone(),
@@ -1307,7 +1359,26 @@ impl TranscriptProvider for FfmpegMediaEngine {
             return Err(EngineError::OutputParentMissing(parent.to_path_buf()));
         }
 
-        let language = request.language.clone().unwrap_or_else(|| "en".to_string());
+        let language = request.language.clone().unwrap_or_else(|| {
+            let mut args = self.ytdlp_js_args();
+            args.extend([
+                "--print".to_string(),
+                "language".to_string(),
+                "--skip-download".to_string(),
+                request.url.clone(),
+            ]);
+            self.run_checked(&self.yt_dlp_bin, &args)
+                .ok()
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|output| output.lines().next().map(str::trim).map(str::to_string))
+                .filter(|value| {
+                    value.len() <= 12
+                        && value
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphabetic() || ch == '-')
+                })
+                .unwrap_or_else(|| "en".to_string())
+        });
         let before = list_files(parent)?;
         let output_base = request
             .output_path
@@ -1319,7 +1390,7 @@ impl TranscriptProvider for FfmpegMediaEngine {
             "--write-subs".to_string(),
             "--write-auto-subs".to_string(),
             "--sub-langs".to_string(),
-            language.clone(),
+            format!("{language}-orig,{language}"),
             "--sub-format".to_string(),
             "vtt".to_string(),
             "--skip-download".to_string(),
@@ -1334,11 +1405,7 @@ impl TranscriptProvider for FfmpegMediaEngine {
             .filter(|path| !before.contains(path))
             .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("vtt"))
             .filter(|path| path.to_string_lossy().starts_with(&output_base))
-            .max_by_key(|path| {
-                fs::metadata(path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-            })
+            .max_by_key(|path| path.to_string_lossy().ends_with("-orig.vtt"))
             .map(|path| {
                 inspect_vtt(&path)?;
                 Ok(path.to_string_lossy().to_string())
@@ -1709,10 +1776,18 @@ impl DiagnosticsProvider for FfmpegMediaEngine {
             &self.ffmpeg_bin,
             vec!["thumbnail".to_string(), "render_clip".to_string()],
         );
-        let yt_dlp = self.tool_diagnostic(
-            &self.yt_dlp_bin,
-            vec!["url_ingest".to_string(), "transcript".to_string()],
-        );
+        // The packaged macOS binary can have a slow first launch. Studio polls
+        // diagnostics, so probing it on every request would spawn overlapping
+        // processes and stall the local workflow.
+        let yt_dlp = self
+            .yt_dlp_diagnostic
+            .get_or_init(|| {
+                self.tool_diagnostic(
+                    &self.yt_dlp_bin,
+                    vec!["url_ingest".to_string(), "transcript".to_string()],
+                )
+            })
+            .clone();
         let js_runtime = ToolDiagnostic {
             name: "yt_dlp_js_runtime".to_string(),
             available: Some(self.yt_dlp_js_runtime.is_some()),
@@ -3157,6 +3232,18 @@ mod tests {
         let path = "/tmp/video.vtt.vtt".to_string();
         let output_base = path.strip_suffix(".vtt").unwrap_or(&path).to_string();
         assert_eq!(output_base, "/tmp/video.vtt");
+    }
+
+    #[test]
+    fn youtube_rolling_captions_keep_only_spoken_text() {
+        let root = TestTempDir::new("tv7-rolling-vtt");
+        let path = root.path().join("rolling.vtt");
+        fs::write(&path, "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHola, <00:00:01.500><c>Rodolfo</c>\n\n00:00:02.000 --> 00:00:02.010\nHola, Rodolfo\n\n00:00:02.010 --> 00:00:03.000\nHola, Rodolfo\n<00:00:02.500><c>¿Qué pasó?</c>\n\n00:00:03.000 --> 00:00:04.000\n¿Qué pasó?\nBien.\n").unwrap();
+        let cues = read_vtt_cues(&path).unwrap();
+        assert_eq!(cues.len(), 3);
+        assert_eq!(cues[0].text, "Hola, Rodolfo");
+        assert_eq!(cues[1].text, "¿Qué pasó?");
+        assert_eq!(cues[2].text, "Bien.");
     }
 
     #[test]
