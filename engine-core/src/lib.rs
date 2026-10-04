@@ -1643,12 +1643,12 @@ impl ClipRenderer for FfmpegMediaEngine {
         };
         let mut args = vec![
             "-y".to_string(),
-            "-i".to_string(),
-            request.source_path.clone(),
             "-ss".to_string(),
             request.start_seconds.to_string(),
-            "-to".to_string(),
-            request.end_seconds.to_string(),
+            "-i".to_string(),
+            request.source_path.clone(),
+            "-t".to_string(),
+            (request.end_seconds - request.start_seconds).to_string(),
         ];
         let mut filters = Vec::new();
         if request.format == RenderFormat::Vertical9x16 {
@@ -3495,6 +3495,70 @@ mod tests {
             assert!(calls[0].contains(&"--write-auto-subs".to_string()));
             assert!(calls[0].contains(&"--sub-langs".to_string()));
         }
+    }
+
+    #[test]
+    fn subtitles_are_visible_after_nonzero_clip_start() {
+        if !ffmpeg_available() {
+            eprintln!("skipping subtitle pixel test because ffmpeg is unavailable");
+            return;
+        }
+        let source = unique_temp_file_path("mp4");
+        let subtitles = unique_temp_file_path("vtt");
+        let clip = unique_temp_file_path("mp4");
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=320x180:r=10",
+                "-t",
+                "2",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&source)
+            .output()
+            .expect("ffmpeg should create a black source");
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        fs::write(
+            &subtitles,
+            "WEBVTT\n\n00:00:00.750 --> 00:00:01.750\nVisible subtitle\n",
+        )
+        .expect("subtitle fixture should be written");
+        FfmpegMediaEngine::new()
+            .render_clip(&RenderClipRequest {
+                source_path: source.to_string_lossy().to_string(),
+                output_path: clip.to_string_lossy().to_string(),
+                start_seconds: 0.75,
+                end_seconds: 1.75,
+                subtitle_path: Some(subtitles.to_string_lossy().to_string()),
+                format: RenderFormat::Source,
+            })
+            .expect("nonzero-start subtitle clip should render");
+        let frame = Command::new("ffmpeg")
+            .args(["-v", "error", "-ss", "0.5", "-i"])
+            .arg(&clip)
+            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .output()
+            .expect("ffmpeg should decode a middle frame");
+        assert!(
+            frame.status.success(),
+            "{}",
+            String::from_utf8_lossy(&frame.stderr)
+        );
+        assert!(
+            frame.stdout.iter().any(|pixel| *pixel > 100),
+            "burned subtitle must create visible pixels on black source"
+        );
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_file(subtitles);
+        let _ = fs::remove_file(clip);
     }
 
     #[test]
