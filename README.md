@@ -96,3 +96,7 @@ pre-commit install
 ```
 
 Every commit runs formatting, compile checks, tests, clippy, dependency advisories via `cargo audit`, dependency license/source policy via `cargo deny`, and basic file hygiene. Run `make quality` or `pre-commit run --all-files` to reproduce failures before committing.
+
+## License
+
+TV7 source in this repository is available under the [MIT License](LICENSE). External dependencies and tools retain their respective licenses. See the [TV7 project overview](https://github.com/TV7-Clip-Studio/tv7-core/blob/main/PROJECT.md) for the repository map and current scope.
