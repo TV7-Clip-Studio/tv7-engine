@@ -1045,11 +1045,18 @@ fn parse_ai_json<T: serde::de::DeserializeOwned>(content: &str) -> Result<T, Clo
     let end = end.ok_or_else(invalid)?;
     // Surrounding prose and Markdown fences are tolerated, but a second JSON
     // object/array makes the intended answer ambiguous.
-    let outside = format!("{}{}", &content[..start], &content[end..]);
-    if outside
-        .chars()
-        .any(|ch| matches!(ch, '{' | '}' | '[' | ']'))
-    {
+    let (before, after) = (&content[..start], &content[end..]);
+    let wrapped_in_array = before.trim_end().ends_with('[') && after.trim_start().starts_with(']');
+    let has_other_json = [before, after].into_iter().any(|prose| {
+        prose.contains(['{', '}'])
+            || prose.match_indices('[').any(|(index, _)| {
+                serde_json::Deserializer::from_str(&prose[index..])
+                    .into_iter::<Vec<serde_json::Value>>()
+                    .next()
+                    .is_some_and(|item| item.is_ok())
+            })
+    });
+    if wrapped_in_array || has_other_json {
         return Err(invalid());
     }
     serde_json::from_str(&content[start..end]).map_err(|_| invalid())
@@ -5847,7 +5854,7 @@ mod tests {
     fn transcript_intelligence_accepts_one_wrapped_json_object() {
         let json = r#"{"clips":[{"title":"A brace } in speech","start_seconds":1,"end_seconds":7,"reason":"Complete thought","score":0.8}]}"#;
         let fenced = format!("```json\n{json}\n```");
-        let prose = format!("Here are the clips:\n{json}\nReady for review.");
+        let prose = format!("Here are the clips [see below]:\n{json}\nReady for review.");
         for response in [json.to_string(), fenced, prose] {
             let parsed = parse_ai_clip_envelope(&response).unwrap();
             assert_eq!(parsed.clips[0].title, "A brace } in speech");
@@ -5860,6 +5867,8 @@ mod tests {
         for response in [
             format!("{json}\n{json}"),
             format!("[{json}]"),
+            format!("Another result [1, 2] before {json}"),
+            format!("{json} and an extra []"),
             "```json\n{\"clips\": [}\n```".to_string(),
             "Here is a partial object: {\"clips\":[]".to_string(),
         ] {
