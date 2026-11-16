@@ -51,7 +51,7 @@ jobs:
 
   deepseek-review:
     needs: determine-context
-    uses: TV7-Clip-Studio/tv7-core/.github/workflows/deepseek-review.yml@main
+    uses: TV7-Clip-Studio/tv7-core/.github/workflows/deepseek-review.yml@0b2174e7949d4349aee72b5cd42917c16306ca0e
     with:
       project_context: ${{ needs.determine-context.outputs.info }}
       architecture_doc: engine_architecture.md

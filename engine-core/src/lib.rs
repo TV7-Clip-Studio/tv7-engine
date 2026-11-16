@@ -812,38 +812,27 @@ impl CommandExecutor for ProcessCommandExecutor {
         args: &[String],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ToolOutput, EngineError> {
-        use std::io::Read;
         use std::process::Stdio;
         use std::thread;
         use std::time::Duration;
         let mut child = Command::new(executable)
             .args(args)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| EngineError::CommandFailed {
                 command: executable.to_string(),
                 message: error.to_string(),
             })?;
-        let mut stderr = child.stderr.take().expect("piped stderr should exist");
-        let stderr_reader = thread::spawn(move || {
-            let mut tail = Vec::new();
-            let mut chunk = [0u8; 4096];
-            while let Ok(read) = stderr.read(&mut chunk) {
-                if read == 0 {
-                    break;
-                }
-                tail.extend_from_slice(&chunk[..read]);
-                if tail.len() > 64 * 1024 {
-                    tail.drain(..tail.len() - 64 * 1024);
-                }
-            }
-            tail
-        });
+        let stdout = child.stdout.take().expect("piped stdout should exist");
+        let stderr = child.stderr.take().expect("piped stderr should exist");
+        let stdout_reader = thread::spawn(move || read_output_tail(stdout));
+        let stderr_reader = thread::spawn(move || read_output_tail(stderr));
         loop {
             if cancelled() {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 return Err(EngineError::CommandFailed {
                     command: executable.to_string(),
@@ -857,10 +846,11 @@ impl CommandExecutor for ProcessCommandExecutor {
                     message: error.to_string(),
                 })? {
                 Some(status) => {
+                    let stdout = stdout_reader.join().unwrap_or_default();
                     let stderr = stderr_reader.join().unwrap_or_default();
                     return Ok(ToolOutput {
                         status_success: status.success(),
-                        stdout: Vec::new(),
+                        stdout,
                         stderr,
                     });
                 }
@@ -868,6 +858,22 @@ impl CommandExecutor for ProcessCommandExecutor {
             }
         }
     }
+}
+
+fn read_output_tail(mut stream: impl std::io::Read) -> Vec<u8> {
+    const LIMIT: usize = 64 * 1024;
+    let mut tail = Vec::new();
+    let mut chunk = [0; 4096];
+    while let Ok(read) = stream.read(&mut chunk) {
+        if read == 0 {
+            break;
+        }
+        tail.extend_from_slice(&chunk[..read]);
+        if tail.len() > LIMIT {
+            tail.drain(..tail.len() - LIMIT);
+        }
+    }
+    tail
 }
 
 pub trait MediaProbe: Send + Sync {
@@ -3292,6 +3298,15 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn cancelable_process_preserves_reported_output_path() {
+        let output = ProcessCommandExecutor
+            .run_cancelable("printf", &["%s".into(), "download.mp4".into()], &|| false)
+            .unwrap();
+        assert!(output.status_success);
+        assert_eq!(output.stdout, b"download.mp4");
+    }
+
     #[test]
     fn process_executor_preserves_failure_stderr() {
         let output = ProcessCommandExecutor
