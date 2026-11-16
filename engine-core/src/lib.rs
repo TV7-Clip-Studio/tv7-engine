@@ -39,7 +39,110 @@ pub struct RenderClipRequest {
     #[serde(default)]
     pub subtitle_path: Option<String>,
     #[serde(default)]
+    pub subtitle_style: Option<SubtitleStyle>,
+    #[serde(default)]
     pub format: RenderFormat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SubtitleStyle {
+    pub font_size: u32,
+    pub bottom_margin: u32,
+    pub bold: bool,
+    pub preset: String,
+    pub font_name: String,
+    pub color: String,
+    pub highlight_color: String,
+    pub outline: u32,
+    pub keywords: String,
+}
+impl Default for SubtitleStyle {
+    fn default() -> Self {
+        Self {
+            font_size: 28,
+            bottom_margin: 55,
+            bold: true,
+            preset: "bold".into(),
+            font_name: "Arial".into(),
+            color: "#FFFFFF".into(),
+            highlight_color: "#D0F26B".into(),
+            outline: 3,
+            keywords: String::new(),
+        }
+    }
+}
+impl SubtitleStyle {
+    pub fn validate(&self) -> Result<(), EngineError> {
+        self.filter_style().map(|_| ())
+    }
+    fn filter_style_for_format(&self, format: RenderFormat) -> Result<String, EngineError> {
+        let style = self.filter_style()?;
+        // ASS defaults use a 288-high canvas. Portrait text sizes are width-relative
+        // so a normal caption does not become a giant block after 9:16 framing.
+        if format == RenderFormat::Source {
+            return Ok(style);
+        }
+        Ok(style.replace(
+            &format!("FontSize={}", self.font_size),
+            &format!(
+                "FontSize={:.2}",
+                self.font_size as f64 * 288.0 / (384.0 * 16.0 / 9.0)
+            ),
+        ))
+    }
+    fn filter_style(&self) -> Result<String, EngineError> {
+        ass_color(&self.highlight_color)?;
+        if !(12..=40).contains(&self.font_size)
+            || !(10..=100).contains(&self.bottom_margin)
+            || self.outline > 5
+            || self.keywords.len() > 500
+            || !["clean", "bold", "boxed", "highlight", "word_box"].contains(&self.preset.as_str())
+            || !["Arial", "Verdana", "DejaVu Sans"].contains(&self.font_name.as_str())
+        {
+            return Err(EngineError::OutputInvalid(
+                "Invalid subtitle style, font, size, placement or outline".into(),
+            ));
+        }
+        Ok(format!(
+            "FontName={},FontSize={},MarginV={},Bold={},Outline={},Shadow=0,Alignment=2,PrimaryColour={},OutlineColour={},BorderStyle={}",
+            self.font_name,
+            self.font_size,
+            self.bottom_margin,
+            if self.bold { -1 } else { 0 },
+            self.outline,
+            ass_color(&self.color)?,
+            if self.preset == "word_box" {
+                "&HFF000000"
+            } else if self.preset == "boxed" {
+                "&H60000000"
+            } else {
+                "&H00000000"
+            },
+            if self.preset == "boxed" || self.preset == "word_box" {
+                3
+            } else {
+                1
+            }
+        ))
+    }
+}
+
+fn ass_color(color: &str) -> Result<String, EngineError> {
+    if color.len() != 7
+        || !color.starts_with('#')
+        || !color[1..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(EngineError::OutputInvalid(
+            "Expected subtitle color #RRGGBB".into(),
+        ));
+    }
+    Ok(format!(
+        "&H00{}{}{}",
+        &color[5..7],
+        &color[3..5],
+        &color[1..3]
+    ))
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,6 +154,8 @@ pub enum RenderFormat {
     Vertical9x16,
     #[serde(rename = "vertical_9_16_crop")]
     Vertical9x16Crop,
+    #[serde(rename = "vertical_9_16_blur")]
+    Vertical9x16Blur,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -376,6 +481,8 @@ pub struct TranscriptDownloadResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TranscriptGenerateRequest {
+    #[serde(default)]
+    pub word_timestamps: bool,
     pub media_path: String,
     pub output_path: String,
     pub language: Option<String>,
@@ -1230,7 +1337,6 @@ impl UrlIngestor for FfmpegMediaEngine {
         let metadata: serde_json::Value = serde_json::from_slice(&metadata_output.stdout)
             .map_err(|error| EngineError::OutputInvalid(error.to_string()))?;
 
-        let before = list_files(output_dir)?;
         let template = request
             .output_template
             .clone()
@@ -1242,6 +1348,8 @@ impl UrlIngestor for FfmpegMediaEngine {
             "bv*[vcodec^=avc1][height<=1080][protocol=https]+ba[acodec^=mp4a][protocol=https]/bv*[height<=1080][protocol=https]+ba[protocol=https]/b[height<=1080][protocol=https]".to_string(),
             "--merge-output-format".to_string(),
             "mp4".to_string(),
+            "--print".to_string(),
+            "after_move:filepath".to_string(),
             "--no-playlist".to_string(),
             "-o".to_string(),
             output_pattern.to_string_lossy().to_string(),
@@ -1256,16 +1364,26 @@ impl UrlIngestor for FfmpegMediaEngine {
                 message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             });
         }
-        let after = list_files(output_dir)?;
-        let media_path = after
-            .into_iter()
-            .filter(|path| !before.contains(path))
-            .max_by_key(|path| {
-                fs::metadata(path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-            })
-            .map(|path| path.to_string_lossy().to_string());
+        // Shared-directory scans can pick another concurrent job or subtitle file.
+        // Use this job's final merged output reported by yt-dlp after all moves.
+        let reported = String::from_utf8_lossy(&output.stdout);
+        let path = reported
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| PathBuf::from(line.trim()))
+            .ok_or_else(|| {
+                EngineError::OutputInvalid("yt-dlp did not report a final media path".into())
+            })?;
+        let path = fs::canonicalize(path).map_err(|error| EngineError::Io(error.to_string()))?;
+        let root =
+            fs::canonicalize(output_dir).map_err(|error| EngineError::Io(error.to_string()))?;
+        if !path.starts_with(&root) || !path.is_file() {
+            return Err(EngineError::OutputInvalid(
+                "yt-dlp reported a file outside the output directory".into(),
+            ));
+        }
+        let media_path = Some(path.to_string_lossy().to_string());
 
         Ok(UrlIngestResult {
             url: request.url.clone(),
@@ -1433,6 +1551,12 @@ impl TranscriptProvider for FfmpegMediaEngine {
             )));
         }
 
+        if request.word_timestamps && !request.output_path.ends_with("-words.vtt") {
+            return Err(EngineError::InvalidPath(
+                "Word timing output_path must end in -words.vtt".into(),
+            ));
+        }
+
         let whisper_bin =
             self.whisper_bin
                 .as_deref()
@@ -1500,7 +1624,7 @@ impl TranscriptProvider for FfmpegMediaEngine {
             .strip_suffix(".vtt")
             .unwrap_or(&request.output_path)
             .to_string();
-        let args = vec![
+        let mut args = vec![
             "-m".to_string(),
             whisper_model.to_string_lossy().to_string(),
             "-f".to_string(),
@@ -1511,6 +1635,9 @@ impl TranscriptProvider for FfmpegMediaEngine {
             "-of".to_string(),
             output_base,
         ];
+        if request.word_timestamps {
+            args.extend(["-ml".into(), "1".into(), "-sow".into()]);
+        }
         self.run_checked(whisper_bin, &args)?;
 
         if !output_path.is_file() {
@@ -1520,6 +1647,12 @@ impl TranscriptProvider for FfmpegMediaEngine {
             )));
         }
 
+        if request.word_timestamps {
+            let raw =
+                fs::read_to_string(output_path).map_err(|e| EngineError::Io(e.to_string()))?;
+            let clean = normalize_whisper_words(&raw)?;
+            fs::write(output_path, clean).map_err(|e| EngineError::Io(e.to_string()))?;
+        }
         inspect_vtt(output_path)?;
 
         Ok(TranscriptGenerateResult {
@@ -1634,10 +1767,11 @@ impl ClipRenderer for FfmpegMediaEngine {
         }
 
         let overlay = match request.subtitle_path.as_deref() {
-            Some(path) => Some(create_clip_subtitle_overlay(
+            Some(path) => Some(create_styled_clip_subtitle_overlay(
                 Path::new(path),
                 request.start_seconds,
                 request.end_seconds,
+                &request.subtitle_style.clone().unwrap_or_default(),
             )?),
             None => None,
         };
@@ -1662,11 +1796,25 @@ impl ClipRenderer for FfmpegMediaEngine {
         }
         if let Some(overlay) = overlay.as_ref() {
             filters.push(format!(
-                "subtitles=filename={}",
-                escape_ffmpeg_filter_path(&overlay.path)
+                "subtitles=filename={}:force_style='{}'",
+                escape_ffmpeg_filter_path(&overlay.path),
+                request
+                    .subtitle_style
+                    .clone()
+                    .unwrap_or_default()
+                    .filter_style_for_format(request.format)?
             ));
         }
-        if !filters.is_empty() {
+        if request.format == RenderFormat::Vertical9x16Blur {
+            let finish = if filters.is_empty() {
+                "null".into()
+            } else {
+                filters.join(",")
+            };
+            args.extend(["-filter_complex".into(), format!(
+                "[0:v]split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:2[background];[fg]scale=1080:1920:force_original_aspect_ratio=decrease[foreground];[background][foreground]overlay=(W-w)/2:(H-h)/2,setsar=1,{finish}[out]"
+            ), "-map".into(), "[out]".into(), "-map".into(), "0:a?".into()]);
+        } else if !filters.is_empty() {
             args.extend(["-vf".to_string(), filters.join(",")]);
         }
         args.extend([
@@ -1708,12 +1856,23 @@ impl Drop for TemporarySubtitle {
     }
 }
 
+#[cfg(test)]
 fn create_clip_subtitle_overlay(
     path: &Path,
     start: f64,
     end: f64,
 ) -> Result<TemporarySubtitle, EngineError> {
+    create_styled_clip_subtitle_overlay(path, start, end, &SubtitleStyle::default())
+}
+
+fn create_styled_clip_subtitle_overlay(
+    path: &Path,
+    start: f64,
+    end: f64,
+    style: &SubtitleStyle,
+) -> Result<TemporarySubtitle, EngineError> {
     use std::io::Write;
+    style.validate()?;
     let cues = read_vtt(path)?;
     let selected = cues
         .into_iter()
@@ -1729,8 +1888,13 @@ fn create_clip_subtitle_overlay(
         .unwrap_or_default()
         .as_nanos();
     let temp = std::env::temp_dir().join(format!(
-        "tv7-clip-subtitles-{}-{unique}.vtt",
-        std::process::id()
+        "tv7-clip-subtitles-{}-{unique}.{}",
+        std::process::id(),
+        if style.preset == "highlight" || style.preset == "word_box" {
+            "ass"
+        } else {
+            "vtt"
+        }
     ));
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -1738,23 +1902,195 @@ fn create_clip_subtitle_overlay(
         .open(&temp)
         .map_err(|error| EngineError::Io(error.to_string()))?;
     let guard = TemporarySubtitle { path: temp };
-    file.write_all(b"WEBVTT\n\n")
+    let header = if style.preset == "highlight" || style.preset == "word_box" {
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: 384\nPlayResY: 288\nWrapStyle: 0\n[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\nStyle: Default,Arial,22,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,2,15,15,55,1\n[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
+    } else {
+        "WEBVTT\n\n"
+    };
+    let header = if style.preset == "word_box" {
+        header.replace(",100,100,0,0,1,2,0,2,", ",100,100,0,0,3,3,0,2,")
+    } else {
+        header.to_string()
+    };
+    file.write_all(header.as_bytes())
         .map_err(|error| EngineError::Io(error.to_string()))?;
-    for cue in selected {
-        let cue_start = (cue.start.max(start) - start).max(0.0);
-        let cue_end = (cue.end.min(end) - start).max(0.0);
-        let block = format!(
-            "{} --> {}\n{}\n\n",
-            format_vtt_time(cue_start),
-            format_vtt_time(cue_end),
-            cue.text
-        );
-        file.write_all(block.as_bytes())
-            .map_err(|error| EngineError::Io(error.to_string()))?;
+    if style.preset == "word_box" {
+        if !path.to_string_lossy().ends_with("-words.vtt")
+            || selected
+                .iter()
+                .any(|cue| cue.text.split_whitespace().count() != 1)
+        {
+            return Err(EngineError::OutputInvalid(
+                "Word box requires local word timestamps. Generate word timing first.".into(),
+            ));
+        }
+        let highlight = ass_color(&style.highlight_color)?;
+        for group in word_groups(&selected) {
+            let phrase_start = group[0].start.max(start) - start;
+            let phrase_end = group.last().unwrap().end.min(end) - start;
+            let plain = group
+                .iter()
+                .map(|cue| ass_safe_word(&cue.text))
+                .collect::<Vec<_>>()
+                .join(" ");
+            writeln!(
+                file,
+                "Dialogue: 0,{},{},Default,,0,0,0,,{{\\3a&HFF&}}{}",
+                ass_time(phrase_start),
+                ass_time(phrase_end),
+                plain
+            )
+            .map_err(|e| EngineError::Io(e.to_string()))?;
+            for (active, word) in group.iter().enumerate() {
+                let text = group.iter().enumerate().map(|(index, cue)| {
+                    let clean = ass_safe_word(&cue.text);
+                    if index == active { format!("{{\\1a&H00&\\3a&H00&\\1c&H00181510&\\3c{highlight}}}{clean}{{\\1a&HFF&\\3a&HFF&}}") } else { clean }
+                }).collect::<Vec<_>>().join(" ");
+                writeln!(
+                    file,
+                    "Dialogue: 1,{},{},Default,,0,0,0,,{{\\1a&HFF&\\3a&HFF&}}{}",
+                    ass_time(word.start.max(start) - start),
+                    ass_time(word.end.min(end) - start),
+                    text
+                )
+                .map_err(|e| EngineError::Io(e.to_string()))?;
+            }
+        }
+    } else {
+        for cue in selected {
+            let cue_start = (cue.start.max(start) - start).max(0.0);
+            let cue_end = (cue.end.min(end) - start).max(0.0);
+            let block = if style.preset == "highlight" {
+                format!(
+                    "Dialogue: 0,{},{},Default,,0,0,0,,{}\n",
+                    ass_time(cue_start),
+                    ass_time(cue_end),
+                    emphasized_text(&cue.text, style)?
+                )
+            } else {
+                format!(
+                    "{} --> {}\n{}\n\n",
+                    format_vtt_time(cue_start),
+                    format_vtt_time(cue_end),
+                    cue.text
+                )
+            };
+            file.write_all(block.as_bytes())
+                .map_err(|error| EngineError::Io(error.to_string()))?;
+        }
     }
     file.sync_all()
         .map_err(|error| EngineError::Io(error.to_string()))?;
     Ok(guard)
+}
+
+// Drop empty and zero-duration special-token artifacts without creating new times.
+fn normalize_whisper_words(raw: &str) -> Result<String, EngineError> {
+    let mut clean = String::from("WEBVTT\n\n");
+    for block in raw.replace("\r\n", "\n").split("\n\n").skip(1) {
+        let Some(timing) = block.lines().find(|line| line.contains("-->")) else {
+            continue;
+        };
+        let Some((begin, finish)) = timing.split_once("-->") else {
+            continue;
+        };
+        let text = block
+            .lines()
+            .skip_while(|line| !line.contains("-->"))
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.trim().is_empty() || parse_vtt_time(finish.trim())? <= parse_vtt_time(begin.trim())?
+        {
+            continue;
+        }
+        if text.split_whitespace().count() != 1 {
+            return Err(EngineError::OutputInvalid(
+                "Whisper did not return single-word timing".into(),
+            ));
+        }
+        clean.push_str(&format!("{timing}\n{}\n\n", text.trim()));
+    }
+    Ok(clean)
+}
+
+// Phrase grouping changes display only; every highlight retains the audio-derived word interval.
+fn word_groups(cues: &[VttCue]) -> Vec<&[VttCue]> {
+    let mut groups = Vec::new();
+    let mut first = 0;
+    let mut characters = 0;
+    for (index, cue) in cues.iter().enumerate() {
+        if index > first
+            && (index - first >= 4
+                || characters + cue.text.chars().count() > 32
+                || cue.start - cues[index - 1].end > 0.6)
+        {
+            groups.push(&cues[first..index]);
+            first = index;
+            characters = 0;
+        }
+        characters += cue.text.chars().count() + 1;
+        if cue.text.trim_end().ends_with(['.', '!', '?']) {
+            groups.push(&cues[first..=index]);
+            first = index + 1;
+            characters = 0;
+        }
+    }
+    if first < cues.len() {
+        groups.push(&cues[first..]);
+    }
+    groups
+}
+fn ass_safe_word(text: &str) -> String {
+    text.replace(['{', '}', '\\'], "").trim().to_string()
+}
+
+fn ass_time(seconds: f64) -> String {
+    let ticks = (seconds * 100.0).round() as u64;
+    format!(
+        "{}:{:02}:{:02}.{:02}",
+        ticks / 360000,
+        ticks / 6000 % 60,
+        ticks / 100 % 60,
+        ticks % 100
+    )
+}
+
+fn emphasized_text(text: &str, style: &SubtitleStyle) -> Result<String, EngineError> {
+    let clean = text.replace(['{', '}', '\\'], "");
+    let words: Vec<_> = clean.split_whitespace().collect();
+    let normalize = |word: &str| {
+        word.trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase()
+    };
+    let specified: Vec<_> = style
+        .keywords
+        .split(',')
+        .map(normalize)
+        .filter(|word| !word.is_empty())
+        .collect();
+    let longest = words
+        .iter()
+        .max_by_key(|word| normalize(word).chars().count())
+        .map(|word| normalize(word));
+    let highlight = ass_color(&style.highlight_color)?;
+    let primary = ass_color(&style.color)?;
+    Ok(words
+        .into_iter()
+        .map(|word| {
+            let key = normalize(word);
+            if specified.contains(&key)
+                || (specified.is_empty()
+                    && key.chars().count() >= 5
+                    && longest.as_ref() == Some(&key))
+            {
+                format!("{{\\c{highlight}}}{word}{{\\c{primary}}}")
+            } else {
+                word.into()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" "))
 }
 
 fn escape_ffmpeg_filter_path(path: &Path) -> String {
@@ -2462,6 +2798,127 @@ struct FfprobeFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtitle_presets_validate_size_and_safe_margin() {
+        assert!(
+            SubtitleStyle::default()
+                .filter_style()
+                .unwrap()
+                .contains("MarginV=55")
+        );
+        for style in [
+            SubtitleStyle {
+                font_size: 41,
+                ..Default::default()
+            },
+            SubtitleStyle {
+                bottom_margin: 101,
+                ..Default::default()
+            },
+        ] {
+            assert!(style.filter_style().is_err());
+        }
+        let regular = SubtitleStyle {
+            font_size: 28,
+            bottom_margin: 55,
+            bold: false,
+            ..Default::default()
+        }
+        .filter_style()
+        .unwrap();
+        assert!(regular.contains("FontSize=28,MarginV=55,Bold=0"));
+    }
+
+    #[test]
+    fn highlighted_subtitles_clip_timing_and_reject_filter_injection() {
+        let path = unique_temp_file_path("vtt");
+        fs::write(
+            &path,
+            "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\nUn contrato {evil} \\N\n",
+        )
+        .unwrap();
+        let style = SubtitleStyle {
+            preset: "highlight".into(),
+            keywords: "contrato".into(),
+            ..Default::default()
+        };
+        let overlay = create_styled_clip_subtitle_overlay(&path, 2.0, 3.5, &style).unwrap();
+        let text = fs::read_to_string(&overlay.path).unwrap();
+        assert!(text.contains("0:00:00.00,0:00:01.50"));
+        assert!(text.contains("{\\c&H006BF2D0}contrato{\\c&H00FFFFFF}"));
+        assert!(!text.contains("{evil}"));
+        assert!(!text.contains("\\N"));
+        let old: SubtitleStyle =
+            serde_json::from_str(r#"{"font_size":22,"bottom_margin":32,"bold":true}"#).unwrap();
+        assert!(old.validate().is_ok());
+        assert!(
+            style
+                .filter_style_for_format(RenderFormat::Vertical9x16Blur)
+                .unwrap()
+                .contains("FontSize=11.81")
+        );
+        assert!(
+            SubtitleStyle {
+                color: "#FFFFFF,evil".into(),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            SubtitleStyle {
+                font_name: "Arial,evil".into(),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        fs::remove_file(path).unwrap();
+        drop(overlay);
+    }
+
+    #[test]
+    fn whisper_word_artifacts_are_removed_without_changing_speech_times() {
+        let raw = "WEBVTT\n\n00:00:00.000 --> 00:00:00.000\n\n\n00:00:00.050 --> 00:00:00.860\n Bueno,\n\n00:00:00.860 --> 00:00:00.860\n[special]\n\n00:00:00.860 --> 00:00:01.230\n fue\n\n";
+        let clean = normalize_whisper_words(raw).unwrap();
+        assert!(clean.contains("00:00:00.050 --> 00:00:00.860\nBueno,"));
+        assert!(clean.contains("00:00:00.860 --> 00:00:01.230\nfue"));
+        assert!(!clean.contains("special"));
+        assert_eq!(clean.matches("-->").count(), 2);
+    }
+
+    #[test]
+    fn word_box_preserves_word_times_and_clips_intervals() {
+        let path = std::env::temp_dir().join(format!(
+            "tv7-test-{}-words.vtt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, "WEBVTT\n\n00:00:01.000 --> 00:00:01.810\nBueno,\n\n00:00:01.810 --> 00:00:02.180\nfue\n\n00:00:02.180 --> 00:00:02.430\nel\n\n00:00:02.430 --> 00:00:03.320\nrulo.\n").unwrap();
+        let style = SubtitleStyle {
+            preset: "word_box".into(),
+            ..Default::default()
+        };
+        let overlay = create_styled_clip_subtitle_overlay(&path, 1.4, 3.0, &style).unwrap();
+        let text = fs::read_to_string(&overlay.path).unwrap();
+        assert!(text.contains("Dialogue: 1,0:00:00.00,0:00:00.41"));
+        assert!(text.contains("Dialogue: 1,0:00:00.41,0:00:00.78"));
+        assert!(text.contains("Dialogue: 1,0:00:01.03,0:00:01.60"));
+        assert!(text.contains("Bueno, fue el rulo."));
+        assert!(text.contains("\\3c&H006BF2D0"));
+        assert!(style.filter_style().unwrap().contains("BorderStyle=3"));
+        fs::write(
+            &path,
+            "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nA sentence without word timing\n",
+        )
+        .unwrap();
+        assert!(create_styled_clip_subtitle_overlay(&path, 1.0, 3.0, &style).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
     use std::collections::VecDeque;
     use std::process::Command;
     use std::sync::Mutex;
@@ -2649,6 +3106,52 @@ mod tests {
         std::env::temp_dir().join(format!(
             "tv7-engine-test-{process_id}-{nanos}-{counter}.{extension}"
         ))
+    }
+
+    #[test]
+    fn url_ingest_uses_reported_final_file_not_shared_directory_changes() {
+        let root = unique_temp_file_path("downloads");
+        fs::create_dir(&root).unwrap();
+        let media = root.join("own-video.mp4");
+        fs::write(&media, b"video").unwrap();
+        fs::write(root.join("other-job.mp4.part"), b"partial").unwrap();
+        fs::write(root.join("other-transcript.vtt"), b"WEBVTT").unwrap();
+        let executor = Arc::new(MockExecutor::new(vec![
+            Ok(ToolOutput {
+                status_success: true,
+                stdout: br#"{"title":"Own video"}"#.to_vec(),
+                stderr: vec![],
+            }),
+            Ok(ToolOutput {
+                status_success: true,
+                stdout: format!("{}\n", media.display()).into_bytes(),
+                stderr: vec![],
+            }),
+        ]));
+        let engine = FfmpegMediaEngine::with_all_bins_and_executor(
+            "ffmpeg",
+            "ffprobe",
+            "yt-dlp",
+            executor.clone(),
+        );
+        let result = engine
+            .ingest_url(&UrlIngestRequest {
+                url: "https://www.youtube.com/watch?v=3sQMjs8YS7U".into(),
+                output_dir: root.to_string_lossy().into(),
+                output_template: Some("own-video.%(ext)s".into()),
+            })
+            .unwrap();
+        assert_eq!(
+            result.media_path.unwrap(),
+            fs::canonicalize(&media).unwrap().to_string_lossy()
+        );
+        assert!(
+            executor.calls()[1]
+                .1
+                .windows(2)
+                .any(|args| args == ["--print", "after_move:filepath"])
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn ffmpeg_available() -> bool {
@@ -2893,6 +3396,7 @@ mod tests {
                 start_seconds: 10.0,
                 end_seconds: 5.0,
                 subtitle_path: None,
+                subtitle_style: None,
                 format: RenderFormat::Source,
             })
             .expect_err("invalid range should fail");
@@ -2962,6 +3466,7 @@ mod tests {
                 start_seconds: 0.0,
                 end_seconds: 1.0,
                 subtitle_path: None,
+                subtitle_style: None,
                 format: RenderFormat::Source,
             })
             .expect_err("same source and output should fail");
@@ -3366,6 +3871,7 @@ mod tests {
 
         let result = engine
             .generate_transcript(&TranscriptGenerateRequest {
+                word_timestamps: false,
                 media_path: media_path.to_string_lossy().to_string(),
                 output_path: output_path.to_string_lossy().to_string(),
                 language: Some("en".to_string()),
@@ -3425,6 +3931,7 @@ mod tests {
         assert!(
             engine
                 .generate_transcript(&TranscriptGenerateRequest {
+                    word_timestamps: false,
                     media_path: media_path.to_string_lossy().to_string(),
                     output_path: output_path.to_string_lossy().to_string(),
                     language: Some("en".into()),
@@ -3455,6 +3962,7 @@ mod tests {
         );
         let result = engine
             .generate_transcript(&TranscriptGenerateRequest {
+                word_timestamps: false,
                 media_path: media_path.to_string_lossy().to_string(),
                 output_path: output_path.to_string_lossy().to_string(),
                 language: None,
@@ -3538,6 +4046,7 @@ mod tests {
                 start_seconds: 0.75,
                 end_seconds: 1.75,
                 subtitle_path: Some(subtitles.to_string_lossy().to_string()),
+                subtitle_style: None,
                 format: RenderFormat::Source,
             })
             .expect("nonzero-start subtitle clip should render");
@@ -3601,6 +4110,7 @@ mod tests {
                 start_seconds: 0.25,
                 end_seconds: 1.25,
                 subtitle_path: None,
+                subtitle_style: None,
                 format: RenderFormat::Source,
             })
             .expect("clip should be rendered");
@@ -3628,6 +4138,7 @@ mod tests {
                 start_seconds: 0.25,
                 end_seconds: 1.25,
                 subtitle_path: Some(subtitle_path.to_string_lossy().to_string()),
+                subtitle_style: None,
                 format: RenderFormat::Source,
             })
             .expect("captioned clip should render with ffmpeg subtitles filter");
@@ -3639,6 +4150,7 @@ mod tests {
                 start_seconds: 0.25,
                 end_seconds: 0.75,
                 subtitle_path: Some(subtitle_path.to_string_lossy().to_string()),
+                subtitle_style: None,
                 format: RenderFormat::Vertical9x16,
             })
             .expect("vertical captioned clip should render");
@@ -3677,6 +4189,7 @@ mod tests {
                 start_seconds: 0.25,
                 end_seconds: 0.75,
                 subtitle_path: Some(subtitle_path.to_string_lossy().to_string()),
+                subtitle_style: None,
                 format: RenderFormat::Vertical9x16Crop,
             })
             .expect("cropped vertical captioned clip should render");
