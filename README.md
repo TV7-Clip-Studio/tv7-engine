@@ -20,6 +20,7 @@ Local-first engine that powers media and AI workloads for the TV7 app. The codeb
   - `POST /v1/media/probe`
   - `POST /v1/media/thumbnail`
   - `POST /v1/media/render-clip`
+  - `GET /v1/media/source?path=...`
   - `POST /v1/ingest/url`
   - `POST /v1/transcripts/download`
   - `POST /v1/transcripts/generate`
@@ -30,6 +31,8 @@ Local-first engine that powers media and AI workloads for the TV7 app. The codeb
 - Loopback-only surface; inputs must use absolute paths.
 - Browser calls from local Studio are allowed only for `http://127.0.0.1:8080` and `http://localhost:8080` (CORS); Engine still binds to loopback only. CORS does not authenticate callers on the local machine.
 - Local transcript generation requires explicit `TV7_ENGINE_WHISPER_BIN` and `TV7_ENGINE_WHISPER_MODEL` setup; Engine reports `TRANSCRIPTION_SETUP_REQUIRED` instead of downloading models silently.
+- For local transcription, Engine extracts temporary mono 16 kHz PCM WAV audio with FFmpeg before invoking Whisper. The WAV is removed on success or failure, and a successful job requires a VTT with timed cues. Omitted `language` uses Whisper automatic detection; the result's `language: "auto"` records that mode, not a detected language code.
+- URL transcript download requests creator subtitles and automatic subtitles. When neither exists, the successful job result has `transcript_path: null`; Studio can then request local transcription when setup is ready. Returned or generated VTT files must have usable timed cues.
 - Studio migration details live in `docs/core/contracts/tv7-engine/studio-sidecar-migration.md`.
 
 ## Run Locally
@@ -39,7 +42,7 @@ make dev
 
 ## Selected YouTube Channel Flow
 
-- `POST /v1/channels/discover` with `{"url":"https://www.youtube.com/@creator/videos","cursor":0}` lists up to 25 videos. `next_cursor` can be sent for another page; discovery stops at 500 entries and never downloads media.
+- `POST /v1/channels/discover` with `{"url":"https://www.youtube.com/@creator/videos","cursor":0}` lists up to 25 videos. `next_cursor` can be sent for another page; discovery stops at 500 entries and never downloads media. Selected downloads prefer direct HTTPS AVC/AAC at up to 1080p, then other direct HTTPS formats, to avoid unreliable HLS choices.
 - A channel handle URL such as `https://www.youtube.com/@creator` is normalized to its `/videos` tab. A first page with no videos is reported as an error so the UI can show yt-dlp's diagnostic instead of treating it as a successful empty channel.
 - `POST /v1/ingest/selected` with `{"videos":[{"id":"abcdefghijk","url":"https://www.youtube.com/watch?v=abcdefghijk"}]}` starts one job per selected video and returns `jobs` with `video_id` and `job_id`. The optional `output_dir` must be an existing directory inside Engine's asset directory. Selection is capped at 25 videos per request.
 - `POST /v1/ingest/url` with `{"url":"https://www.youtube.com/watch?v=abcdefghijk"}` starts a single download job. Its optional `output_dir` follows the same Engine asset directory restriction.
@@ -50,10 +53,11 @@ Downloads are user-initiated for media the user is authorized to download. The E
 
 ## Local Transcript Candidates And Captioned Render
 
-- `POST /v1/transcripts/candidates` accepts an Engine-owned VTT `transcript_path`, optional `max_candidates` (1–12, default 8), and optional `max_duration_seconds` (15–90, default 45). It returns chronological cue ranges sampled across the transcript with excerpt text and cue counts. These are deterministic review candidates, not viral predictions or quality scores.
-- `POST /v1/media/render-clip` accepts optional `subtitle_path` pointing to an Engine-owned VTT. Engine shifts overlapping cues to the clip timeline, burns them into the video with FFmpeg, and cleans up its temporary subtitle file. A clip with no overlapping cues returns an error.
+- `POST /v1/transcripts/candidates` accepts an Engine-owned VTT `transcript_path`, optional `max_candidates` (1–12, default 8), and optional `max_duration_seconds` (15–90, default 45). It returns chronological cue ranges sampled across the transcript with excerpt text and cue counts. Bracketed non-speech cues are trimmed at window edges, pure non-speech windows are omitted, and very short windows with little speech are omitted. These are deterministic review candidates, not viral predictions or quality scores.
+- `POST /v1/media/render-clip` accepts optional `subtitle_path` pointing to an Engine-owned VTT and optional `format` (`source`, the default, `vertical_9_16`, or `vertical_9_16_crop`). Engine shifts overlapping cues to the clip timeline, burns them into the video with FFmpeg, and cleans up its temporary subtitle file. A clip with no overlapping cues returns an error. `vertical_9_16` fits the full source inside a padded 1080 × 1920 canvas; `vertical_9_16_crop` fills the same canvas with a center crop. Captions are applied after framing. Both encode H.264 yuv420p video with AAC audio when the source has audio. Fit preserves the full frame but can produce large black bands for landscape videos; crop fills the frame but may cut off the subject. Studio should preview the result before publishing.
 - Candidate generation reads at most 5 MiB and 20,000 cues. The Engine HTTP boundary canonicalizes VTT paths and accepts them only under its asset directory.
 - `POST /v1/transcripts/import` accepts one multipart `.vtt` `file` field (up to 5 MiB). Engine validates timed cues before atomically storing the transcript in its asset directory. The response provides `transcript_id`, `transcript_path`, `cue_count`, and `duration_seconds`; browser and desktop clients pass `transcript_path` to candidate generation and captioned rendering.
+- `GET /v1/media/source?path=...` previews an Engine-owned MP4, M4V, WebM, or MOV source using an absolute, URL-encoded path. It supports HTTP byte ranges for seeking, caps files at 1 GiB, and uses the same bearer token middleware as other Engine routes. Studio must include that token when one is configured.
 
 ## Approved Clip Export
 

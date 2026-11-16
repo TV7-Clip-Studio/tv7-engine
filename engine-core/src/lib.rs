@@ -5,7 +5,7 @@ use std::fs;
 use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -38,6 +38,124 @@ pub struct RenderClipRequest {
     pub end_seconds: f64,
     #[serde(default)]
     pub subtitle_path: Option<String>,
+    #[serde(default)]
+    pub subtitle_style: Option<SubtitleStyle>,
+    #[serde(default)]
+    pub format: RenderFormat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SubtitleStyle {
+    pub font_size: u32,
+    pub bottom_margin: u32,
+    pub bold: bool,
+    pub preset: String,
+    pub font_name: String,
+    pub color: String,
+    pub highlight_color: String,
+    pub outline: u32,
+    pub keywords: String,
+}
+impl Default for SubtitleStyle {
+    fn default() -> Self {
+        Self {
+            font_size: 28,
+            bottom_margin: 55,
+            bold: true,
+            preset: "bold".into(),
+            font_name: "Arial".into(),
+            color: "#FFFFFF".into(),
+            highlight_color: "#D0F26B".into(),
+            outline: 3,
+            keywords: String::new(),
+        }
+    }
+}
+impl SubtitleStyle {
+    pub fn validate(&self) -> Result<(), EngineError> {
+        self.filter_style().map(|_| ())
+    }
+    fn filter_style_for_format(&self, format: RenderFormat) -> Result<String, EngineError> {
+        let style = self.filter_style()?;
+        // ASS defaults use a 288-high canvas. Portrait text sizes are width-relative
+        // so a normal caption does not become a giant block after 9:16 framing.
+        if format == RenderFormat::Source {
+            return Ok(style);
+        }
+        Ok(style.replace(
+            &format!("FontSize={}", self.font_size),
+            &format!(
+                "FontSize={:.2}",
+                self.font_size as f64 * 288.0 / (384.0 * 16.0 / 9.0)
+            ),
+        ))
+    }
+    fn filter_style(&self) -> Result<String, EngineError> {
+        ass_color(&self.highlight_color)?;
+        if !(12..=40).contains(&self.font_size)
+            || !(10..=100).contains(&self.bottom_margin)
+            || self.outline > 5
+            || self.keywords.len() > 500
+            || !["clean", "bold", "boxed", "highlight", "word_box"].contains(&self.preset.as_str())
+            || !["Arial", "Verdana", "DejaVu Sans"].contains(&self.font_name.as_str())
+        {
+            return Err(EngineError::OutputInvalid(
+                "Invalid subtitle style, font, size, placement or outline".into(),
+            ));
+        }
+        Ok(format!(
+            "FontName={},FontSize={},MarginV={},Bold={},Outline={},Shadow=0,Alignment=2,PrimaryColour={},OutlineColour={},BorderStyle={}",
+            self.font_name,
+            self.font_size,
+            self.bottom_margin,
+            if self.bold { -1 } else { 0 },
+            self.outline,
+            ass_color(&self.color)?,
+            if self.preset == "word_box" {
+                "&HFF000000"
+            } else if self.preset == "boxed" {
+                "&H60000000"
+            } else {
+                "&H00000000"
+            },
+            if self.preset == "boxed" || self.preset == "word_box" {
+                3
+            } else {
+                1
+            }
+        ))
+    }
+}
+
+fn ass_color(color: &str) -> Result<String, EngineError> {
+    if color.len() != 7
+        || !color.starts_with('#')
+        || !color[1..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(EngineError::OutputInvalid(
+            "Expected subtitle color #RRGGBB".into(),
+        ));
+    }
+    Ok(format!(
+        "&H00{}{}{}",
+        &color[5..7],
+        &color[3..5],
+        &color[1..3]
+    ))
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RenderFormat {
+    #[default]
+    #[serde(rename = "source")]
+    Source,
+    #[serde(rename = "vertical_9_16")]
+    Vertical9x16,
+    #[serde(rename = "vertical_9_16_crop")]
+    Vertical9x16Crop,
+    #[serde(rename = "vertical_9_16_blur")]
+    Vertical9x16Blur,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -82,6 +200,24 @@ pub fn inspect_vtt(path: &Path) -> Result<VttMetadata, EngineError> {
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimedTranscriptCue {
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub text: String,
+}
+
+pub fn read_vtt_cues(path: &Path) -> Result<Vec<TimedTranscriptCue>, EngineError> {
+    Ok(read_vtt(path)?
+        .into_iter()
+        .map(|cue| TimedTranscriptCue {
+            start_seconds: cue.start,
+            end_seconds: cue.end,
+            text: cue.text,
+        })
+        .collect())
+}
+
 #[derive(Debug, Clone)]
 struct VttCue {
     start: f64,
@@ -111,9 +247,28 @@ pub fn generate_candidates(request: &CandidateRequest) -> Result<CandidateRespon
             index += 1;
         }
         let group = &cues[first..index];
+        let Some(first_speech) = group.iter().position(|cue| !is_non_speech_cue(&cue.text)) else {
+            continue;
+        };
+        let last_speech = group
+            .iter()
+            .rposition(|cue| !is_non_speech_cue(&cue.text))
+            .unwrap();
+        let group = &group[first_speech..=last_speech];
+        let start = group[0].start;
+        let end = group.last().unwrap().end.min(start + max_duration);
+        let spoken_words = group
+            .iter()
+            .filter(|cue| !is_non_speech_cue(&cue.text))
+            .flat_map(|cue| cue.text.split_whitespace())
+            .filter(|word| word.chars().any(char::is_alphanumeric))
+            .count();
+        if end - start < 3.0 || (end - start < 8.0 && spoken_words < 8) {
+            continue;
+        }
         windows.push(TranscriptCandidate {
             start_seconds: start,
-            end_seconds: group.last().unwrap().end.min(start + max_duration),
+            end_seconds: end,
             text: group
                 .iter()
                 .map(|cue| cue.text.as_str())
@@ -138,6 +293,11 @@ pub fn generate_candidates(request: &CandidateRequest) -> Result<CandidateRespon
     Ok(CandidateResponse { candidates })
 }
 
+fn is_non_speech_cue(text: &str) -> bool {
+    let text = text.trim();
+    (text.starts_with('[') && text.ends_with(']')) || (text.starts_with('(') && text.ends_with(')'))
+}
+
 fn read_vtt(path: &Path) -> Result<Vec<VttCue>, EngineError> {
     if !path.is_absolute() {
         return Err(EngineError::InvalidPath(
@@ -157,6 +317,7 @@ fn read_vtt(path: &Path) -> Result<Vec<VttCue>, EngineError> {
     if !normalized.starts_with("WEBVTT") {
         return Err(EngineError::OutputInvalid("expected WEBVTT header".into()));
     }
+    let rolling_captions = normalized.contains("<00:");
     let mut cues = Vec::new();
     for block in normalized.split("\n\n").skip(1) {
         let mut lines = block.lines();
@@ -176,8 +337,26 @@ fn read_vtt(path: &Path) -> Result<Vec<VttCue>, EngineError> {
                 "VTT cue end must exceed start".into(),
             ));
         }
-        let text = lines.collect::<Vec<_>>().join(" ").trim().to_string();
+        // YouTube auto captions carry karaoke timestamps and repeat the prior
+        // line while the next line is spoken. Keep the newest visible line.
+        let raw_lines = lines.collect::<Vec<_>>();
+        let cleaned = raw_lines
+            .iter()
+            .map(|line| clean_vtt_line(line))
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        let text = if rolling_captions {
+            cleaned.last().cloned().unwrap_or_default()
+        } else {
+            cleaned.join(" ")
+        };
         if text.is_empty() {
+            continue;
+        }
+        if cues
+            .last()
+            .is_some_and(|previous: &VttCue| previous.text == text)
+        {
             continue;
         }
         if cues.len() >= 20_000 {
@@ -192,6 +371,26 @@ fn read_vtt(path: &Path) -> Result<Vec<VttCue>, EngineError> {
         ));
     }
     Ok(cues)
+}
+
+fn clean_vtt_line(line: &str) -> String {
+    let mut result = String::new();
+    let mut inside_tag = false;
+    for ch in line.chars() {
+        match ch {
+            '<' => inside_tag = true,
+            '>' if inside_tag => inside_tag = false,
+            _ if !inside_tag => result.push(ch),
+            _ => {}
+        }
+    }
+    result
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_vtt_time(value: &str) -> Result<f64, EngineError> {
@@ -282,6 +481,8 @@ pub struct TranscriptDownloadResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TranscriptGenerateRequest {
+    #[serde(default)]
+    pub word_timestamps: bool,
     pub media_path: String,
     pub output_path: String,
     pub language: Option<String>,
@@ -611,38 +812,27 @@ impl CommandExecutor for ProcessCommandExecutor {
         args: &[String],
         cancelled: &dyn Fn() -> bool,
     ) -> Result<ToolOutput, EngineError> {
-        use std::io::Read;
         use std::process::Stdio;
         use std::thread;
         use std::time::Duration;
         let mut child = Command::new(executable)
             .args(args)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| EngineError::CommandFailed {
                 command: executable.to_string(),
                 message: error.to_string(),
             })?;
-        let mut stderr = child.stderr.take().expect("piped stderr should exist");
-        let stderr_reader = thread::spawn(move || {
-            let mut tail = Vec::new();
-            let mut chunk = [0u8; 4096];
-            while let Ok(read) = stderr.read(&mut chunk) {
-                if read == 0 {
-                    break;
-                }
-                tail.extend_from_slice(&chunk[..read]);
-                if tail.len() > 64 * 1024 {
-                    tail.drain(..tail.len() - 64 * 1024);
-                }
-            }
-            tail
-        });
+        let stdout = child.stdout.take().expect("piped stdout should exist");
+        let stderr = child.stderr.take().expect("piped stderr should exist");
+        let stdout_reader = thread::spawn(move || read_output_tail(stdout));
+        let stderr_reader = thread::spawn(move || read_output_tail(stderr));
         loop {
             if cancelled() {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 return Err(EngineError::CommandFailed {
                     command: executable.to_string(),
@@ -656,10 +846,11 @@ impl CommandExecutor for ProcessCommandExecutor {
                     message: error.to_string(),
                 })? {
                 Some(status) => {
+                    let stdout = stdout_reader.join().unwrap_or_default();
                     let stderr = stderr_reader.join().unwrap_or_default();
                     return Ok(ToolOutput {
                         status_success: status.success(),
-                        stdout: Vec::new(),
+                        stdout,
                         stderr,
                     });
                 }
@@ -667,6 +858,22 @@ impl CommandExecutor for ProcessCommandExecutor {
             }
         }
     }
+}
+
+fn read_output_tail(mut stream: impl std::io::Read) -> Vec<u8> {
+    const LIMIT: usize = 64 * 1024;
+    let mut tail = Vec::new();
+    let mut chunk = [0; 4096];
+    while let Ok(read) = stream.read(&mut chunk) {
+        if read == 0 {
+            break;
+        }
+        tail.extend_from_slice(&chunk[..read]);
+        if tail.len() > LIMIT {
+            tail.drain(..tail.len() - LIMIT);
+        }
+    }
+    tail
 }
 
 pub trait MediaProbe: Send + Sync {
@@ -739,6 +946,7 @@ pub struct FfmpegMediaEngine {
     whisper_bin: Option<String>,
     whisper_model: Option<PathBuf>,
     executor: Arc<dyn CommandExecutor>,
+    yt_dlp_diagnostic: Arc<OnceLock<ToolDiagnostic>>,
 }
 
 impl fmt::Debug for FfmpegMediaEngine {
@@ -770,6 +978,7 @@ impl FfmpegMediaEngine {
             whisper_bin: None,
             whisper_model: None,
             executor: Arc::new(ProcessCommandExecutor),
+            yt_dlp_diagnostic: Arc::new(OnceLock::new()),
         }
     }
 
@@ -782,6 +991,7 @@ impl FfmpegMediaEngine {
             whisper_bin: None,
             whisper_model: None,
             executor: Arc::new(ProcessCommandExecutor),
+            yt_dlp_diagnostic: Arc::new(OnceLock::new()),
         }
     }
 
@@ -798,6 +1008,7 @@ impl FfmpegMediaEngine {
             whisper_bin: None,
             whisper_model: None,
             executor: Arc::new(ProcessCommandExecutor),
+            yt_dlp_diagnostic: Arc::new(OnceLock::new()),
         }
     }
 
@@ -816,6 +1027,7 @@ impl FfmpegMediaEngine {
             whisper_bin,
             whisper_model,
             executor: Arc::new(ProcessCommandExecutor),
+            yt_dlp_diagnostic: Arc::new(OnceLock::new()),
         }
     }
 
@@ -832,6 +1044,7 @@ impl FfmpegMediaEngine {
             whisper_bin: None,
             whisper_model: None,
             executor,
+            yt_dlp_diagnostic: Arc::new(OnceLock::new()),
         }
     }
 
@@ -849,6 +1062,7 @@ impl FfmpegMediaEngine {
             whisper_bin: None,
             whisper_model: None,
             executor,
+            yt_dlp_diagnostic: Arc::new(OnceLock::new()),
         }
     }
 
@@ -868,6 +1082,7 @@ impl FfmpegMediaEngine {
             whisper_bin,
             whisper_model,
             executor,
+            yt_dlp_diagnostic: Arc::new(OnceLock::new()),
         }
     }
 
@@ -1031,7 +1246,7 @@ fn tool_version_args(name: &str) -> Vec<String> {
         .and_then(|value| value.to_str())
         .unwrap_or(name)
         .to_ascii_lowercase();
-    if executable_name == "yt-dlp" || executable_name == "yt_dlp" {
+    if executable_name.starts_with("yt-dlp") || executable_name.starts_with("yt_dlp") {
         vec!["--version".to_string()]
     } else {
         vec!["-version".to_string()]
@@ -1128,7 +1343,6 @@ impl UrlIngestor for FfmpegMediaEngine {
         let metadata: serde_json::Value = serde_json::from_slice(&metadata_output.stdout)
             .map_err(|error| EngineError::OutputInvalid(error.to_string()))?;
 
-        let before = list_files(output_dir)?;
         let template = request
             .output_template
             .clone()
@@ -1136,6 +1350,13 @@ impl UrlIngestor for FfmpegMediaEngine {
         let output_pattern = output_dir.join(template);
         let mut download_args = self.ytdlp_js_args();
         download_args.extend(vec![
+            "--format".to_string(),
+            "bv*[vcodec^=avc1][height<=1080][protocol=https]+ba[acodec^=mp4a][protocol=https]/bv*[height<=1080][protocol=https]+ba[protocol=https]/b[height<=1080][protocol=https]".to_string(),
+            "--merge-output-format".to_string(),
+            "mp4".to_string(),
+            "--print".to_string(),
+            "after_move:filepath".to_string(),
+            "--no-playlist".to_string(),
             "-o".to_string(),
             output_pattern.to_string_lossy().to_string(),
             request.url.clone(),
@@ -1149,16 +1370,26 @@ impl UrlIngestor for FfmpegMediaEngine {
                 message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             });
         }
-        let after = list_files(output_dir)?;
-        let media_path = after
-            .into_iter()
-            .filter(|path| !before.contains(path))
-            .max_by_key(|path| {
-                fs::metadata(path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-            })
-            .map(|path| path.to_string_lossy().to_string());
+        // Shared-directory scans can pick another concurrent job or subtitle file.
+        // Use this job's final merged output reported by yt-dlp after all moves.
+        let reported = String::from_utf8_lossy(&output.stdout);
+        let path = reported
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| PathBuf::from(line.trim()))
+            .ok_or_else(|| {
+                EngineError::OutputInvalid("yt-dlp did not report a final media path".into())
+            })?;
+        let path = fs::canonicalize(path).map_err(|error| EngineError::Io(error.to_string()))?;
+        let root =
+            fs::canonicalize(output_dir).map_err(|error| EngineError::Io(error.to_string()))?;
+        if !path.starts_with(&root) || !path.is_file() {
+            return Err(EngineError::OutputInvalid(
+                "yt-dlp reported a file outside the output directory".into(),
+            ));
+        }
+        let media_path = Some(path.to_string_lossy().to_string());
 
         Ok(UrlIngestResult {
             url: request.url.clone(),
@@ -1252,7 +1483,26 @@ impl TranscriptProvider for FfmpegMediaEngine {
             return Err(EngineError::OutputParentMissing(parent.to_path_buf()));
         }
 
-        let language = request.language.clone().unwrap_or_else(|| "en".to_string());
+        let language = request.language.clone().unwrap_or_else(|| {
+            let mut args = self.ytdlp_js_args();
+            args.extend([
+                "--print".to_string(),
+                "language".to_string(),
+                "--skip-download".to_string(),
+                request.url.clone(),
+            ]);
+            self.run_checked(&self.yt_dlp_bin, &args)
+                .ok()
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|output| output.lines().next().map(str::trim).map(str::to_string))
+                .filter(|value| {
+                    value.len() <= 12
+                        && value
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphabetic() || ch == '-')
+                })
+                .unwrap_or_else(|| "en".to_string())
+        });
         let before = list_files(parent)?;
         let output_base = request
             .output_path
@@ -1261,14 +1511,15 @@ impl TranscriptProvider for FfmpegMediaEngine {
             .to_string();
         let mut args = self.ytdlp_js_args();
         args.extend(vec![
-            "--write-auto-sub".to_string(),
-            "--sub-lang".to_string(),
-            language.clone(),
+            "--write-subs".to_string(),
+            "--write-auto-subs".to_string(),
+            "--sub-langs".to_string(),
+            format!("{language}-orig,{language}"),
             "--sub-format".to_string(),
             "vtt".to_string(),
             "--skip-download".to_string(),
             "-o".to_string(),
-            output_base,
+            output_base.clone(),
             request.url.clone(),
         ]);
         self.run_checked(&self.yt_dlp_bin, &args)?;
@@ -1277,12 +1528,13 @@ impl TranscriptProvider for FfmpegMediaEngine {
             .into_iter()
             .filter(|path| !before.contains(path))
             .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("vtt"))
-            .max_by_key(|path| {
-                fs::metadata(path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
+            .filter(|path| path.to_string_lossy().starts_with(&output_base))
+            .max_by_key(|path| path.to_string_lossy().ends_with("-orig.vtt"))
+            .map(|path| {
+                inspect_vtt(&path)?;
+                Ok(path.to_string_lossy().to_string())
             })
-            .map(|path| path.to_string_lossy().to_string());
+            .transpose()?;
 
         Ok(TranscriptDownloadResult {
             transcript_path,
@@ -1305,6 +1557,12 @@ impl TranscriptProvider for FfmpegMediaEngine {
             )));
         }
 
+        if request.word_timestamps && !request.output_path.ends_with("-words.vtt") {
+            return Err(EngineError::InvalidPath(
+                "Word timing output_path must end in -words.vtt".into(),
+            ));
+        }
+
         let whisper_bin =
             self.whisper_bin
                 .as_deref()
@@ -1322,23 +1580,70 @@ impl TranscriptProvider for FfmpegMediaEngine {
 
         self.validate_source_path(whisper_model)?;
 
-        let language = request.language.clone().unwrap_or_else(|| "en".to_string());
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let audio_path = output_path.parent().unwrap().join(format!(
+            "tv7-transcription-{}-{unique}.wav",
+            std::process::id()
+        ));
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&audio_path)
+            .map_err(|error| EngineError::Io(error.to_string()))?;
+        let temporary_audio = TemporaryAudio { path: audio_path };
+        self.run_checked(
+            &self.ffmpeg_bin,
+            &[
+                "-v".to_string(),
+                "error".to_string(),
+                "-y".to_string(),
+                "-i".to_string(),
+                request.media_path.clone(),
+                "-vn".to_string(),
+                "-ac".to_string(),
+                "1".to_string(),
+                "-ar".to_string(),
+                "16000".to_string(),
+                "-c:a".to_string(),
+                "pcm_s16le".to_string(),
+                temporary_audio.path.to_string_lossy().to_string(),
+            ],
+        )?;
+        if fs::metadata(&temporary_audio.path)
+            .map(|metadata| metadata.len() <= 44)
+            .unwrap_or(true)
+        {
+            return Err(EngineError::OutputInvalid(
+                "audio extraction produced no usable WAV".into(),
+            ));
+        }
+
+        let language = request
+            .language
+            .clone()
+            .unwrap_or_else(|| "auto".to_string());
         let output_base = request
             .output_path
             .strip_suffix(".vtt")
             .unwrap_or(&request.output_path)
             .to_string();
-        let args = vec![
+        let mut args = vec![
             "-m".to_string(),
             whisper_model.to_string_lossy().to_string(),
             "-f".to_string(),
-            request.media_path.clone(),
+            temporary_audio.path.to_string_lossy().to_string(),
             "-l".to_string(),
             language.clone(),
             "-ovtt".to_string(),
             "-of".to_string(),
             output_base,
         ];
+        if request.word_timestamps {
+            args.extend(["-ml".into(), "1".into(), "-sow".into()]);
+        }
         self.run_checked(whisper_bin, &args)?;
 
         if !output_path.is_file() {
@@ -1347,6 +1652,14 @@ impl TranscriptProvider for FfmpegMediaEngine {
                 output_path.display()
             )));
         }
+
+        if request.word_timestamps {
+            let raw =
+                fs::read_to_string(output_path).map_err(|e| EngineError::Io(e.to_string()))?;
+            let clean = normalize_whisper_words(&raw)?;
+            fs::write(output_path, clean).map_err(|e| EngineError::Io(e.to_string()))?;
+        }
+        inspect_vtt(output_path)?;
 
         Ok(TranscriptGenerateResult {
             transcript_path: request.output_path.clone(),
@@ -1460,34 +1773,61 @@ impl ClipRenderer for FfmpegMediaEngine {
         }
 
         let overlay = match request.subtitle_path.as_deref() {
-            Some(path) => Some(create_clip_subtitle_overlay(
+            Some(path) => Some(create_styled_clip_subtitle_overlay(
                 Path::new(path),
                 request.start_seconds,
                 request.end_seconds,
+                &request.subtitle_style.clone().unwrap_or_default(),
             )?),
             None => None,
         };
         let mut args = vec![
             "-y".to_string(),
-            "-i".to_string(),
-            request.source_path.clone(),
             "-ss".to_string(),
             request.start_seconds.to_string(),
-            "-to".to_string(),
-            request.end_seconds.to_string(),
+            "-i".to_string(),
+            request.source_path.clone(),
+            "-t".to_string(),
+            (request.end_seconds - request.start_seconds).to_string(),
         ];
+        let mut filters = Vec::new();
+        if request.format == RenderFormat::Vertical9x16 {
+            filters.push("scale=1080:1920:force_original_aspect_ratio=decrease".to_string());
+            filters.push("pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black".to_string());
+            filters.push("setsar=1".to_string());
+        } else if request.format == RenderFormat::Vertical9x16Crop {
+            filters.push("scale=1080:1920:force_original_aspect_ratio=increase".to_string());
+            filters.push("crop=1080:1920".to_string());
+            filters.push("setsar=1".to_string());
+        }
         if let Some(overlay) = overlay.as_ref() {
-            args.extend([
-                "-vf".to_string(),
-                format!(
-                    "subtitles=filename={}",
-                    escape_ffmpeg_filter_path(&overlay.path)
-                ),
-            ]);
+            filters.push(format!(
+                "subtitles=filename={}:force_style='{}'",
+                escape_ffmpeg_filter_path(&overlay.path),
+                request
+                    .subtitle_style
+                    .clone()
+                    .unwrap_or_default()
+                    .filter_style_for_format(request.format)?
+            ));
+        }
+        if request.format == RenderFormat::Vertical9x16Blur {
+            let finish = if filters.is_empty() {
+                "null".into()
+            } else {
+                filters.join(",")
+            };
+            args.extend(["-filter_complex".into(), format!(
+                "[0:v]split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:2[background];[fg]scale=1080:1920:force_original_aspect_ratio=decrease[foreground];[background][foreground]overlay=(W-w)/2:(H-h)/2,setsar=1,{finish}[out]"
+            ), "-map".into(), "[out]".into(), "-map".into(), "0:a?".into()]);
+        } else if !filters.is_empty() {
+            args.extend(["-vf".to_string(), filters.join(",")]);
         }
         args.extend([
             "-c:v".to_string(),
             "libx264".to_string(),
+            "-pix_fmt".to_string(),
+            "yuv420p".to_string(),
             "-c:a".to_string(),
             "aac".to_string(),
             request.output_path.clone(),
@@ -1502,6 +1842,16 @@ impl ClipRenderer for FfmpegMediaEngine {
     }
 }
 
+struct TemporaryAudio {
+    path: PathBuf,
+}
+
+impl Drop for TemporaryAudio {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 struct TemporarySubtitle {
     path: PathBuf,
 }
@@ -1512,12 +1862,23 @@ impl Drop for TemporarySubtitle {
     }
 }
 
+#[cfg(test)]
 fn create_clip_subtitle_overlay(
     path: &Path,
     start: f64,
     end: f64,
 ) -> Result<TemporarySubtitle, EngineError> {
+    create_styled_clip_subtitle_overlay(path, start, end, &SubtitleStyle::default())
+}
+
+fn create_styled_clip_subtitle_overlay(
+    path: &Path,
+    start: f64,
+    end: f64,
+    style: &SubtitleStyle,
+) -> Result<TemporarySubtitle, EngineError> {
     use std::io::Write;
+    style.validate()?;
     let cues = read_vtt(path)?;
     let selected = cues
         .into_iter()
@@ -1533,8 +1894,13 @@ fn create_clip_subtitle_overlay(
         .unwrap_or_default()
         .as_nanos();
     let temp = std::env::temp_dir().join(format!(
-        "tv7-clip-subtitles-{}-{unique}.vtt",
-        std::process::id()
+        "tv7-clip-subtitles-{}-{unique}.{}",
+        std::process::id(),
+        if style.preset == "highlight" || style.preset == "word_box" {
+            "ass"
+        } else {
+            "vtt"
+        }
     ));
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -1542,23 +1908,195 @@ fn create_clip_subtitle_overlay(
         .open(&temp)
         .map_err(|error| EngineError::Io(error.to_string()))?;
     let guard = TemporarySubtitle { path: temp };
-    file.write_all(b"WEBVTT\n\n")
+    let header = if style.preset == "highlight" || style.preset == "word_box" {
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: 384\nPlayResY: 288\nWrapStyle: 0\n[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\nStyle: Default,Arial,22,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,2,15,15,55,1\n[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
+    } else {
+        "WEBVTT\n\n"
+    };
+    let header = if style.preset == "word_box" {
+        header.replace(",100,100,0,0,1,2,0,2,", ",100,100,0,0,3,3,0,2,")
+    } else {
+        header.to_string()
+    };
+    file.write_all(header.as_bytes())
         .map_err(|error| EngineError::Io(error.to_string()))?;
-    for cue in selected {
-        let cue_start = (cue.start.max(start) - start).max(0.0);
-        let cue_end = (cue.end.min(end) - start).max(0.0);
-        let block = format!(
-            "{} --> {}\n{}\n\n",
-            format_vtt_time(cue_start),
-            format_vtt_time(cue_end),
-            cue.text
-        );
-        file.write_all(block.as_bytes())
-            .map_err(|error| EngineError::Io(error.to_string()))?;
+    if style.preset == "word_box" {
+        if !path.to_string_lossy().ends_with("-words.vtt")
+            || selected
+                .iter()
+                .any(|cue| cue.text.split_whitespace().count() != 1)
+        {
+            return Err(EngineError::OutputInvalid(
+                "Word box requires local word timestamps. Generate word timing first.".into(),
+            ));
+        }
+        let highlight = ass_color(&style.highlight_color)?;
+        for group in word_groups(&selected) {
+            let phrase_start = group[0].start.max(start) - start;
+            let phrase_end = group.last().unwrap().end.min(end) - start;
+            let plain = group
+                .iter()
+                .map(|cue| ass_safe_word(&cue.text))
+                .collect::<Vec<_>>()
+                .join(" ");
+            writeln!(
+                file,
+                "Dialogue: 0,{},{},Default,,0,0,0,,{{\\3a&HFF&}}{}",
+                ass_time(phrase_start),
+                ass_time(phrase_end),
+                plain
+            )
+            .map_err(|e| EngineError::Io(e.to_string()))?;
+            for (active, word) in group.iter().enumerate() {
+                let text = group.iter().enumerate().map(|(index, cue)| {
+                    let clean = ass_safe_word(&cue.text);
+                    if index == active { format!("{{\\1a&H00&\\3a&H00&\\1c&H00181510&\\3c{highlight}}}{clean}{{\\1a&HFF&\\3a&HFF&}}") } else { clean }
+                }).collect::<Vec<_>>().join(" ");
+                writeln!(
+                    file,
+                    "Dialogue: 1,{},{},Default,,0,0,0,,{{\\1a&HFF&\\3a&HFF&}}{}",
+                    ass_time(word.start.max(start) - start),
+                    ass_time(word.end.min(end) - start),
+                    text
+                )
+                .map_err(|e| EngineError::Io(e.to_string()))?;
+            }
+        }
+    } else {
+        for cue in selected {
+            let cue_start = (cue.start.max(start) - start).max(0.0);
+            let cue_end = (cue.end.min(end) - start).max(0.0);
+            let block = if style.preset == "highlight" {
+                format!(
+                    "Dialogue: 0,{},{},Default,,0,0,0,,{}\n",
+                    ass_time(cue_start),
+                    ass_time(cue_end),
+                    emphasized_text(&cue.text, style)?
+                )
+            } else {
+                format!(
+                    "{} --> {}\n{}\n\n",
+                    format_vtt_time(cue_start),
+                    format_vtt_time(cue_end),
+                    cue.text
+                )
+            };
+            file.write_all(block.as_bytes())
+                .map_err(|error| EngineError::Io(error.to_string()))?;
+        }
     }
     file.sync_all()
         .map_err(|error| EngineError::Io(error.to_string()))?;
     Ok(guard)
+}
+
+// Drop empty and zero-duration special-token artifacts without creating new times.
+fn normalize_whisper_words(raw: &str) -> Result<String, EngineError> {
+    let mut clean = String::from("WEBVTT\n\n");
+    for block in raw.replace("\r\n", "\n").split("\n\n").skip(1) {
+        let Some(timing) = block.lines().find(|line| line.contains("-->")) else {
+            continue;
+        };
+        let Some((begin, finish)) = timing.split_once("-->") else {
+            continue;
+        };
+        let text = block
+            .lines()
+            .skip_while(|line| !line.contains("-->"))
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.trim().is_empty() || parse_vtt_time(finish.trim())? <= parse_vtt_time(begin.trim())?
+        {
+            continue;
+        }
+        if text.split_whitespace().count() != 1 {
+            return Err(EngineError::OutputInvalid(
+                "Whisper did not return single-word timing".into(),
+            ));
+        }
+        clean.push_str(&format!("{timing}\n{}\n\n", text.trim()));
+    }
+    Ok(clean)
+}
+
+// Phrase grouping changes display only; every highlight retains the audio-derived word interval.
+fn word_groups(cues: &[VttCue]) -> Vec<&[VttCue]> {
+    let mut groups = Vec::new();
+    let mut first = 0;
+    let mut characters = 0;
+    for (index, cue) in cues.iter().enumerate() {
+        if index > first
+            && (index - first >= 4
+                || characters + cue.text.chars().count() > 32
+                || cue.start - cues[index - 1].end > 0.6)
+        {
+            groups.push(&cues[first..index]);
+            first = index;
+            characters = 0;
+        }
+        characters += cue.text.chars().count() + 1;
+        if cue.text.trim_end().ends_with(['.', '!', '?']) {
+            groups.push(&cues[first..=index]);
+            first = index + 1;
+            characters = 0;
+        }
+    }
+    if first < cues.len() {
+        groups.push(&cues[first..]);
+    }
+    groups
+}
+fn ass_safe_word(text: &str) -> String {
+    text.replace(['{', '}', '\\'], "").trim().to_string()
+}
+
+fn ass_time(seconds: f64) -> String {
+    let ticks = (seconds * 100.0).round() as u64;
+    format!(
+        "{}:{:02}:{:02}.{:02}",
+        ticks / 360000,
+        ticks / 6000 % 60,
+        ticks / 100 % 60,
+        ticks % 100
+    )
+}
+
+fn emphasized_text(text: &str, style: &SubtitleStyle) -> Result<String, EngineError> {
+    let clean = text.replace(['{', '}', '\\'], "");
+    let words: Vec<_> = clean.split_whitespace().collect();
+    let normalize = |word: &str| {
+        word.trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase()
+    };
+    let specified: Vec<_> = style
+        .keywords
+        .split(',')
+        .map(normalize)
+        .filter(|word| !word.is_empty())
+        .collect();
+    let longest = words
+        .iter()
+        .max_by_key(|word| normalize(word).chars().count())
+        .map(|word| normalize(word));
+    let highlight = ass_color(&style.highlight_color)?;
+    let primary = ass_color(&style.color)?;
+    Ok(words
+        .into_iter()
+        .map(|word| {
+            let key = normalize(word);
+            if specified.contains(&key)
+                || (specified.is_empty()
+                    && key.chars().count() >= 5
+                    && longest.as_ref() == Some(&key))
+            {
+                format!("{{\\c{highlight}}}{word}{{\\c{primary}}}")
+            } else {
+                word.into()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" "))
 }
 
 fn escape_ffmpeg_filter_path(path: &Path) -> String {
@@ -1580,10 +2118,18 @@ impl DiagnosticsProvider for FfmpegMediaEngine {
             &self.ffmpeg_bin,
             vec!["thumbnail".to_string(), "render_clip".to_string()],
         );
-        let yt_dlp = self.tool_diagnostic(
-            &self.yt_dlp_bin,
-            vec!["url_ingest".to_string(), "transcript".to_string()],
-        );
+        // The packaged macOS binary can have a slow first launch. Studio polls
+        // diagnostics, so probing it on every request would spawn overlapping
+        // processes and stall the local workflow.
+        let yt_dlp = self
+            .yt_dlp_diagnostic
+            .get_or_init(|| {
+                self.tool_diagnostic(
+                    &self.yt_dlp_bin,
+                    vec!["url_ingest".to_string(), "transcript".to_string()],
+                )
+            })
+            .clone();
         let js_runtime = ToolDiagnostic {
             name: "yt_dlp_js_runtime".to_string(),
             available: Some(self.yt_dlp_js_runtime.is_some()),
@@ -2258,6 +2804,127 @@ struct FfprobeFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtitle_presets_validate_size_and_safe_margin() {
+        assert!(
+            SubtitleStyle::default()
+                .filter_style()
+                .unwrap()
+                .contains("MarginV=55")
+        );
+        for style in [
+            SubtitleStyle {
+                font_size: 41,
+                ..Default::default()
+            },
+            SubtitleStyle {
+                bottom_margin: 101,
+                ..Default::default()
+            },
+        ] {
+            assert!(style.filter_style().is_err());
+        }
+        let regular = SubtitleStyle {
+            font_size: 28,
+            bottom_margin: 55,
+            bold: false,
+            ..Default::default()
+        }
+        .filter_style()
+        .unwrap();
+        assert!(regular.contains("FontSize=28,MarginV=55,Bold=0"));
+    }
+
+    #[test]
+    fn highlighted_subtitles_clip_timing_and_reject_filter_injection() {
+        let path = unique_temp_file_path("vtt");
+        fs::write(
+            &path,
+            "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\nUn contrato {evil} \\N\n",
+        )
+        .unwrap();
+        let style = SubtitleStyle {
+            preset: "highlight".into(),
+            keywords: "contrato".into(),
+            ..Default::default()
+        };
+        let overlay = create_styled_clip_subtitle_overlay(&path, 2.0, 3.5, &style).unwrap();
+        let text = fs::read_to_string(&overlay.path).unwrap();
+        assert!(text.contains("0:00:00.00,0:00:01.50"));
+        assert!(text.contains("{\\c&H006BF2D0}contrato{\\c&H00FFFFFF}"));
+        assert!(!text.contains("{evil}"));
+        assert!(!text.contains("\\N"));
+        let old: SubtitleStyle =
+            serde_json::from_str(r#"{"font_size":22,"bottom_margin":32,"bold":true}"#).unwrap();
+        assert!(old.validate().is_ok());
+        assert!(
+            style
+                .filter_style_for_format(RenderFormat::Vertical9x16Blur)
+                .unwrap()
+                .contains("FontSize=11.81")
+        );
+        assert!(
+            SubtitleStyle {
+                color: "#FFFFFF,evil".into(),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            SubtitleStyle {
+                font_name: "Arial,evil".into(),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        fs::remove_file(path).unwrap();
+        drop(overlay);
+    }
+
+    #[test]
+    fn whisper_word_artifacts_are_removed_without_changing_speech_times() {
+        let raw = "WEBVTT\n\n00:00:00.000 --> 00:00:00.000\n\n\n00:00:00.050 --> 00:00:00.860\n Bueno,\n\n00:00:00.860 --> 00:00:00.860\n[special]\n\n00:00:00.860 --> 00:00:01.230\n fue\n\n";
+        let clean = normalize_whisper_words(raw).unwrap();
+        assert!(clean.contains("00:00:00.050 --> 00:00:00.860\nBueno,"));
+        assert!(clean.contains("00:00:00.860 --> 00:00:01.230\nfue"));
+        assert!(!clean.contains("special"));
+        assert_eq!(clean.matches("-->").count(), 2);
+    }
+
+    #[test]
+    fn word_box_preserves_word_times_and_clips_intervals() {
+        let path = std::env::temp_dir().join(format!(
+            "tv7-test-{}-words.vtt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, "WEBVTT\n\n00:00:01.000 --> 00:00:01.810\nBueno,\n\n00:00:01.810 --> 00:00:02.180\nfue\n\n00:00:02.180 --> 00:00:02.430\nel\n\n00:00:02.430 --> 00:00:03.320\nrulo.\n").unwrap();
+        let style = SubtitleStyle {
+            preset: "word_box".into(),
+            ..Default::default()
+        };
+        let overlay = create_styled_clip_subtitle_overlay(&path, 1.4, 3.0, &style).unwrap();
+        let text = fs::read_to_string(&overlay.path).unwrap();
+        assert!(text.contains("Dialogue: 1,0:00:00.00,0:00:00.41"));
+        assert!(text.contains("Dialogue: 1,0:00:00.41,0:00:00.78"));
+        assert!(text.contains("Dialogue: 1,0:00:01.03,0:00:01.60"));
+        assert!(text.contains("Bueno, fue el rulo."));
+        assert!(text.contains("\\3c&H006BF2D0"));
+        assert!(style.filter_style().unwrap().contains("BorderStyle=3"));
+        fs::write(
+            &path,
+            "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nA sentence without word timing\n",
+        )
+        .unwrap();
+        assert!(create_styled_clip_subtitle_overlay(&path, 1.0, 3.0, &style).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
     use std::collections::VecDeque;
     use std::process::Command;
     use std::sync::Mutex;
@@ -2302,12 +2969,14 @@ mod tests {
     #[derive(Debug)]
     struct TranscriptExecutor {
         calls: Mutex<Vec<(String, Vec<String>)>>,
+        fail_stage: Option<&'static str>,
     }
 
     impl TranscriptExecutor {
         fn new() -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                fail_stage: None,
             }
         }
 
@@ -2325,13 +2994,60 @@ mod tests {
                 .lock()
                 .expect("mock lock should not be poisoned")
                 .push((executable.to_string(), args.to_vec()));
+            if self.fail_stage == Some(executable) {
+                return Err(EngineError::CommandFailed {
+                    command: executable.to_string(),
+                    message: "fixture failure".to_string(),
+                });
+            }
+            if executable == "ffmpeg" {
+                fs::write(args.last().unwrap(), vec![1u8; 64])
+                    .map_err(|error| EngineError::Io(error.to_string()))?;
+                return Ok(ToolOutput {
+                    status_success: true,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                });
+            }
+            let input = args.windows(2).find(|pair| pair[0] == "-f").unwrap()[1].clone();
+            assert!(
+                Path::new(&input).is_file(),
+                "Whisper must receive extracted WAV"
+            );
             let output_base = args
                 .windows(2)
                 .find(|pair| pair[0] == "-of")
                 .map(|pair| pair[1].clone())
                 .expect("transcript command should include -of");
-            fs::write(format!("{output_base}.vtt"), "WEBVTT\n\n")
+            fs::write(
+                format!("{output_base}.vtt"),
+                "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n",
+            )
+            .map_err(|error| EngineError::Io(error.to_string()))?;
+            Ok(ToolOutput {
+                status_success: true,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    struct CaptionExecutor {
+        calls: Mutex<Vec<Vec<String>>>,
+        produce_caption: bool,
+    }
+
+    impl CommandExecutor for CaptionExecutor {
+        fn run(&self, _executable: &str, args: &[String]) -> Result<ToolOutput, EngineError> {
+            self.calls.lock().unwrap().push(args.to_vec());
+            if self.produce_caption {
+                let base = args.windows(2).find(|pair| pair[0] == "-o").unwrap()[1].clone();
+                fs::write(
+                    format!("{base}.en.vtt"),
+                    "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nCaption\n",
+                )
                 .map_err(|error| EngineError::Io(error.to_string()))?;
+            }
             Ok(ToolOutput {
                 status_success: true,
                 stdout: Vec::new(),
@@ -2396,6 +3112,52 @@ mod tests {
         std::env::temp_dir().join(format!(
             "tv7-engine-test-{process_id}-{nanos}-{counter}.{extension}"
         ))
+    }
+
+    #[test]
+    fn url_ingest_uses_reported_final_file_not_shared_directory_changes() {
+        let root = unique_temp_file_path("downloads");
+        fs::create_dir(&root).unwrap();
+        let media = root.join("own-video.mp4");
+        fs::write(&media, b"video").unwrap();
+        fs::write(root.join("other-job.mp4.part"), b"partial").unwrap();
+        fs::write(root.join("other-transcript.vtt"), b"WEBVTT").unwrap();
+        let executor = Arc::new(MockExecutor::new(vec![
+            Ok(ToolOutput {
+                status_success: true,
+                stdout: br#"{"title":"Own video"}"#.to_vec(),
+                stderr: vec![],
+            }),
+            Ok(ToolOutput {
+                status_success: true,
+                stdout: format!("{}\n", media.display()).into_bytes(),
+                stderr: vec![],
+            }),
+        ]));
+        let engine = FfmpegMediaEngine::with_all_bins_and_executor(
+            "ffmpeg",
+            "ffprobe",
+            "yt-dlp",
+            executor.clone(),
+        );
+        let result = engine
+            .ingest_url(&UrlIngestRequest {
+                url: "https://www.youtube.com/watch?v=3sQMjs8YS7U".into(),
+                output_dir: root.to_string_lossy().into(),
+                output_template: Some("own-video.%(ext)s".into()),
+            })
+            .unwrap();
+        assert_eq!(
+            result.media_path.unwrap(),
+            fs::canonicalize(&media).unwrap().to_string_lossy()
+        );
+        assert!(
+            executor.calls()[1]
+                .1
+                .windows(2)
+                .any(|args| args == ["--print", "after_move:filepath"])
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn ffmpeg_available() -> bool {
@@ -2537,6 +3299,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cancelable_process_preserves_reported_output_path() {
+        let output = ProcessCommandExecutor
+            .run_cancelable("printf", &["%s".into(), "download.mp4".into()], &|| false)
+            .unwrap();
+        assert!(output.status_success);
+        assert_eq!(output.stdout, b"download.mp4");
+    }
+
+    #[test]
     fn process_executor_preserves_failure_stderr() {
         let output = ProcessCommandExecutor
             .run_cancelable(
@@ -2560,10 +3331,16 @@ mod tests {
                 "lavfi",
                 "-i",
                 "testsrc=size=160x90:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100",
                 "-t",
                 "2",
                 "-pix_fmt",
                 "yuv420p",
+                "-c:a",
+                "aac",
             ])
             .arg(path)
             .output()
@@ -2634,11 +3411,39 @@ mod tests {
                 start_seconds: 10.0,
                 end_seconds: 5.0,
                 subtitle_path: None,
+                subtitle_style: None,
+                format: RenderFormat::Source,
             })
             .expect_err("invalid range should fail");
 
         assert!(matches!(error, EngineError::InvalidTimeRange(_)));
         fs::remove_file(file_path).expect("fixture file should be removed");
+    }
+
+    #[test]
+    fn render_format_defaults_to_source_and_rejects_unknown_values() {
+        let base = serde_json::json!({
+            "source_path": "/tmp/source.mp4",
+            "output_path": "/tmp/clip.mp4",
+            "start_seconds": 0.0,
+            "end_seconds": 1.0
+        });
+        let default_request: RenderClipRequest = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(default_request.format, RenderFormat::Source);
+
+        let mut vertical = base.clone();
+        vertical["format"] = serde_json::json!("vertical_9_16");
+        let vertical_request: RenderClipRequest = serde_json::from_value(vertical).unwrap();
+        assert_eq!(vertical_request.format, RenderFormat::Vertical9x16);
+
+        let mut crop = base.clone();
+        crop["format"] = serde_json::json!("vertical_9_16_crop");
+        let crop_request: RenderClipRequest = serde_json::from_value(crop).unwrap();
+        assert_eq!(crop_request.format, RenderFormat::Vertical9x16Crop);
+
+        let mut invalid = base;
+        invalid["format"] = serde_json::json!("arbitrary_ffmpeg_filter");
+        assert!(serde_json::from_value::<RenderClipRequest>(invalid).is_err());
     }
 
     #[test]
@@ -2676,6 +3481,8 @@ mod tests {
                 start_seconds: 0.0,
                 end_seconds: 1.0,
                 subtitle_path: None,
+                subtitle_style: None,
+                format: RenderFormat::Source,
             })
             .expect_err("same source and output should fail");
 
@@ -2948,6 +3755,18 @@ mod tests {
     }
 
     #[test]
+    fn youtube_rolling_captions_keep_only_spoken_text() {
+        let root = TestTempDir::new("tv7-rolling-vtt");
+        let path = root.path().join("rolling.vtt");
+        fs::write(&path, "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHola, <00:00:01.500><c>Rodolfo</c>\n\n00:00:02.000 --> 00:00:02.010\nHola, Rodolfo\n\n00:00:02.010 --> 00:00:03.000\nHola, Rodolfo\n<00:00:02.500><c>¿Qué pasó?</c>\n\n00:00:03.000 --> 00:00:04.000\n¿Qué pasó?\nBien.\n").unwrap();
+        let cues = read_vtt_cues(&path).unwrap();
+        assert_eq!(cues.len(), 3);
+        assert_eq!(cues[0].text, "Hola, Rodolfo");
+        assert_eq!(cues[1].text, "¿Qué pasó?");
+        assert_eq!(cues[2].text, "Bien.");
+    }
+
+    #[test]
     fn transcript_candidates_are_bounded_deterministic_ranges() {
         let root = TestTempDir::new("tv7-candidates");
         let path = root.path().join("transcript.vtt");
@@ -2996,6 +3815,40 @@ mod tests {
     }
 
     #[test]
+    fn candidates_skip_sound_effects_and_weak_short_windows() {
+        let root = TestTempDir::new("tv7-speech-candidates");
+        let path = root.path().join("transcript.vtt");
+        fs::write(&path, "WEBVTT\n\n00:00:00.000 --> 00:00:07.000\n[Music]\n\n00:00:07.000 --> 00:00:18.000\nA real spoken opening with enough context to review.\n\n00:01:00.000 --> 00:01:04.000\nThis short spoken sentence still has enough meaningful words.\n\n00:02:00.000 --> 00:02:03.000\n[XBOX SOUND]\n\n00:03:00.000 --> 00:03:04.000\nHi.\n").unwrap();
+        let response = generate_candidates(&CandidateRequest {
+            transcript_path: path.to_string_lossy().to_string(),
+            max_candidates: Some(5),
+            max_duration_seconds: Some(45.0),
+        })
+        .unwrap();
+        assert_eq!(response.candidates.len(), 2);
+        assert_eq!(
+            (
+                response.candidates[0].start_seconds,
+                response.candidates[0].end_seconds
+            ),
+            (7.0, 18.0)
+        );
+        assert_eq!(
+            (
+                response.candidates[1].start_seconds,
+                response.candidates[1].end_seconds
+            ),
+            (60.0, 64.0)
+        );
+        assert!(
+            response
+                .candidates
+                .iter()
+                .all(|candidate| candidate.end_seconds - candidate.start_seconds <= 45.0)
+        );
+    }
+
+    #[test]
     fn subtitle_overlay_is_clip_relative_and_cleans_up() {
         let root = TestTempDir::new("tv7-subtitle-overlay");
         let path = root.path().join("transcript.vtt");
@@ -3033,6 +3886,7 @@ mod tests {
 
         let result = engine
             .generate_transcript(&TranscriptGenerateRequest {
+                word_timestamps: false,
                 media_path: media_path.to_string_lossy().to_string(),
                 output_path: output_path.to_string_lossy().to_string(),
                 language: Some("en".to_string()),
@@ -3043,14 +3897,192 @@ mod tests {
         assert_eq!(result.format, "vtt");
         assert_eq!(result.language, "en");
         let calls = executor.calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "whisper-cli");
-        assert!(calls[0].1.contains(&"-ovtt".to_string()));
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "ffmpeg");
+        assert!(calls[0].1.windows(2).any(|pair| pair == ["-ac", "1"]));
+        assert!(calls[0].1.windows(2).any(|pair| pair == ["-ar", "16000"]));
         assert!(
             calls[0]
                 .1
+                .windows(2)
+                .any(|pair| pair == ["-c:a", "pcm_s16le"])
+        );
+        assert_eq!(calls[1].0, "whisper-cli");
+        assert!(calls[1].1.contains(&"-ovtt".to_string()));
+        assert!(
+            calls[1]
+                .1
                 .contains(&model_path.to_string_lossy().to_string())
         );
+        let audio_path = calls[0].1.last().unwrap();
+        assert!(audio_path.ends_with(".wav"));
+        assert!(calls[1].1.contains(audio_path));
+        assert!(
+            !Path::new(audio_path).exists(),
+            "temporary WAV must be removed"
+        );
+    }
+
+    #[test]
+    fn generated_transcript_cleans_audio_after_whisper_failure() {
+        let root = TestTempDir::new("tv7-transcript-failure");
+        let media_path = root.path().join("video.mp4");
+        let model_path = root.path().join("ggml-base.bin");
+        let output_path = root.path().join("video.vtt");
+        fs::write(&media_path, b"video").unwrap();
+        fs::write(&model_path, b"model").unwrap();
+        let executor = Arc::new(TranscriptExecutor {
+            calls: Mutex::new(Vec::new()),
+            fail_stage: Some("whisper-cli"),
+        });
+        let engine = FfmpegMediaEngine::with_all_bins_transcription_and_executor(
+            "ffmpeg",
+            "ffprobe",
+            "yt-dlp",
+            Some("whisper-cli".into()),
+            Some(model_path),
+            executor.clone(),
+        );
+        assert!(
+            engine
+                .generate_transcript(&TranscriptGenerateRequest {
+                    word_timestamps: false,
+                    media_path: media_path.to_string_lossy().to_string(),
+                    output_path: output_path.to_string_lossy().to_string(),
+                    language: Some("en".into()),
+                })
+                .is_err()
+        );
+        let audio_path = executor.calls()[0].1.last().unwrap().clone();
+        assert!(!Path::new(&audio_path).exists());
+        assert!(!output_path.exists());
+    }
+
+    #[test]
+    fn generated_transcript_defaults_to_whisper_language_detection() {
+        let root = TestTempDir::new("tv7-transcript-auto-language");
+        let media_path = root.path().join("video.mp4");
+        let model_path = root.path().join("ggml-base.bin");
+        let output_path = root.path().join("video.vtt");
+        fs::write(&media_path, b"video").unwrap();
+        fs::write(&model_path, b"model").unwrap();
+        let executor = Arc::new(TranscriptExecutor::new());
+        let engine = FfmpegMediaEngine::with_all_bins_transcription_and_executor(
+            "ffmpeg",
+            "ffprobe",
+            "yt-dlp",
+            Some("whisper-cli".into()),
+            Some(model_path),
+            executor.clone(),
+        );
+        let result = engine
+            .generate_transcript(&TranscriptGenerateRequest {
+                word_timestamps: false,
+                media_path: media_path.to_string_lossy().to_string(),
+                output_path: output_path.to_string_lossy().to_string(),
+                language: None,
+            })
+            .unwrap();
+        assert_eq!(result.language, "auto");
+        let calls = executor.calls();
+        assert_eq!(
+            calls[1].1.windows(2).find(|pair| pair[0] == "-l").unwrap()[1],
+            "auto"
+        );
+    }
+
+    #[test]
+    fn caption_download_prefers_available_subtitles_and_reports_absence() {
+        for produce_caption in [true, false] {
+            let root = TestTempDir::new("tv7-caption-download");
+            let output = root.path().join("caption.vtt");
+            let executor = Arc::new(CaptionExecutor {
+                calls: Mutex::new(Vec::new()),
+                produce_caption,
+            });
+            let engine = FfmpegMediaEngine::with_executor("ffmpeg", "ffprobe", executor.clone());
+            let result = engine
+                .download_transcript(&TranscriptDownloadRequest {
+                    url: "https://www.youtube.com/watch?v=abcdefghijk".to_string(),
+                    output_path: output.to_string_lossy().to_string(),
+                    language: Some("en".to_string()),
+                })
+                .unwrap();
+            assert_eq!(result.transcript_path.is_some(), produce_caption);
+            if let Some(path) = result.transcript_path {
+                assert_eq!(inspect_vtt(Path::new(&path)).unwrap().cue_count, 1);
+            }
+            let calls = executor.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0].contains(&"--write-subs".to_string()));
+            assert!(calls[0].contains(&"--write-auto-subs".to_string()));
+            assert!(calls[0].contains(&"--sub-langs".to_string()));
+        }
+    }
+
+    #[test]
+    fn subtitles_are_visible_after_nonzero_clip_start() {
+        if !ffmpeg_available() {
+            eprintln!("skipping subtitle pixel test because ffmpeg is unavailable");
+            return;
+        }
+        let source = unique_temp_file_path("mp4");
+        let subtitles = unique_temp_file_path("vtt");
+        let clip = unique_temp_file_path("mp4");
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=320x180:r=10",
+                "-t",
+                "2",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&source)
+            .output()
+            .expect("ffmpeg should create a black source");
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        fs::write(
+            &subtitles,
+            "WEBVTT\n\n00:00:00.750 --> 00:00:01.750\nVisible subtitle\n",
+        )
+        .expect("subtitle fixture should be written");
+        FfmpegMediaEngine::new()
+            .render_clip(&RenderClipRequest {
+                source_path: source.to_string_lossy().to_string(),
+                output_path: clip.to_string_lossy().to_string(),
+                start_seconds: 0.75,
+                end_seconds: 1.75,
+                subtitle_path: Some(subtitles.to_string_lossy().to_string()),
+                subtitle_style: None,
+                format: RenderFormat::Source,
+            })
+            .expect("nonzero-start subtitle clip should render");
+        let frame = Command::new("ffmpeg")
+            .args(["-v", "error", "-ss", "0.5", "-i"])
+            .arg(&clip)
+            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .output()
+            .expect("ffmpeg should decode a middle frame");
+        assert!(
+            frame.status.success(),
+            "{}",
+            String::from_utf8_lossy(&frame.stderr)
+        );
+        assert!(
+            frame.stdout.iter().any(|pixel| *pixel > 100),
+            "burned subtitle must create visible pixels on black source"
+        );
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_file(subtitles);
+        let _ = fs::remove_file(clip);
     }
 
     #[test]
@@ -3093,6 +4125,8 @@ mod tests {
                 start_seconds: 0.25,
                 end_seconds: 1.25,
                 subtitle_path: None,
+                subtitle_style: None,
+                format: RenderFormat::Source,
             })
             .expect("clip should be rendered");
         assert_eq!(
@@ -3105,6 +4139,8 @@ mod tests {
 
         let subtitle_path = unique_temp_file_path("vtt");
         let captioned_path = unique_temp_file_path("mp4");
+        let vertical_path = unique_temp_file_path("mp4");
+        let crop_path = unique_temp_file_path("mp4");
         fs::write(
             &subtitle_path,
             "WEBVTT\n\n00:00:00.000 --> 00:00:01.500\nLocal subtitle\n",
@@ -3117,11 +4153,97 @@ mod tests {
                 start_seconds: 0.25,
                 end_seconds: 1.25,
                 subtitle_path: Some(subtitle_path.to_string_lossy().to_string()),
+                subtitle_style: None,
+                format: RenderFormat::Source,
             })
             .expect("captioned clip should render with ffmpeg subtitles filter");
         assert!(captioned_path.is_file());
+        engine
+            .render_clip(&RenderClipRequest {
+                source_path: source_path.to_string_lossy().to_string(),
+                output_path: vertical_path.to_string_lossy().to_string(),
+                start_seconds: 0.25,
+                end_seconds: 0.75,
+                subtitle_path: Some(subtitle_path.to_string_lossy().to_string()),
+                subtitle_style: None,
+                format: RenderFormat::Vertical9x16,
+            })
+            .expect("vertical captioned clip should render");
+        let vertical_metadata = engine
+            .probe_path(&vertical_path)
+            .expect("vertical clip should be probeable");
+        assert_eq!(
+            (vertical_metadata.width, vertical_metadata.height),
+            (Some(1080), Some(1920))
+        );
+        let streams = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,pix_fmt",
+                "-of",
+                "json",
+            ])
+            .arg(&vertical_path)
+            .output()
+            .expect("ffprobe should inspect vertical clip streams");
+        assert!(streams.status.success());
+        let streams: serde_json::Value = serde_json::from_slice(&streams.stdout).unwrap();
+        let streams = streams["streams"].as_array().unwrap();
+        assert!(
+            streams
+                .iter()
+                .any(|stream| stream["codec_type"] == "video" && stream["pix_fmt"] == "yuv420p")
+        );
+        assert!(streams.iter().any(|stream| stream["codec_type"] == "audio"));
+        engine
+            .render_clip(&RenderClipRequest {
+                source_path: source_path.to_string_lossy().to_string(),
+                output_path: crop_path.to_string_lossy().to_string(),
+                start_seconds: 0.25,
+                end_seconds: 0.75,
+                subtitle_path: Some(subtitle_path.to_string_lossy().to_string()),
+                subtitle_style: None,
+                format: RenderFormat::Vertical9x16Crop,
+            })
+            .expect("cropped vertical captioned clip should render");
+        let crop_metadata = engine
+            .probe_path(&crop_path)
+            .expect("cropped vertical clip should be probeable");
+        assert_eq!(
+            (crop_metadata.width, crop_metadata.height),
+            (Some(1080), Some(1920))
+        );
+        let crop_streams = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,pix_fmt",
+                "-of",
+                "json",
+            ])
+            .arg(&crop_path)
+            .output()
+            .expect("ffprobe should inspect cropped clip streams");
+        assert!(crop_streams.status.success());
+        let crop_streams: serde_json::Value = serde_json::from_slice(&crop_streams.stdout).unwrap();
+        let crop_streams = crop_streams["streams"].as_array().unwrap();
+        assert!(
+            crop_streams
+                .iter()
+                .any(|stream| stream["codec_type"] == "video" && stream["pix_fmt"] == "yuv420p")
+        );
+        assert!(
+            crop_streams
+                .iter()
+                .any(|stream| stream["codec_type"] == "audio")
+        );
         let _ = fs::remove_file(&subtitle_path);
         let _ = fs::remove_file(&captioned_path);
+        let _ = fs::remove_file(&vertical_path);
+        let _ = fs::remove_file(&crop_path);
 
         let clip_metadata = engine
             .probe_path(&clip_path)
