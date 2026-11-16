@@ -2266,7 +2266,7 @@ async fn render_remix(
     Json(payload): Json<RemixRequest>,
 ) -> Result<Json<RenderClipResponse>, ApiError> {
     static REMIX_CAPACITY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-    let _permit = REMIX_CAPACITY.try_acquire().map_err(|_| {
+    let permit = REMIX_CAPACITY.try_acquire().map_err(|_| {
         ApiError::new(
             StatusCode::CONFLICT,
             "REMIX_BUSY",
@@ -2390,17 +2390,29 @@ async fn render_remix(
         ));
     }
     fs::write(&config,serde_json::to_vec(&serde_json::json!({"source":source,"start":payload.start,"end":payload.end,"treatment":payload.treatment,"settings":payload.settings,"cutaways":cutaway_assets,"words":words,"output":output,"progressPath":root.join(".remix-progress.json")})).unwrap()).map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR,"REMIX_FAILED",e.to_string()))?;
-    let config_run = config.clone();
+    let config_guard = PartialUploadGuard(Some(config.clone()));
+    let progress = root.join(".remix-progress.json");
+    let worker_output = output.clone();
     let run = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(
+        // Keep cleanup and capacity owned by the worker even if the caller disconnects.
+        let _permit = permit;
+        let _config = config_guard;
+        let _progress = PartialUploadGuard(Some(progress.clone()));
+        let _pending_progress = PartialUploadGuard(Some(progress.with_extension("json.tmp")));
+        let _ = fs::remove_file(&progress);
+        let mut partial_output = PartialUploadGuard(Some(worker_output));
+        let result = std::process::Command::new(
             std::env::var("TV7_ENGINE_NODE_BIN").unwrap_or_else(|_| "node".into()),
         )
         .arg(worker)
-        .arg(config_run)
-        .output()
+        .arg(config)
+        .output();
+        if result.as_ref().is_ok_and(|output| output.status.success()) {
+            partial_output.0 = None;
+        }
+        result
     })
     .await;
-    let _ = fs::remove_file(config);
     let run = run
         .map_err(|_| {
             ApiError::new(
@@ -2417,7 +2429,6 @@ async fn render_remix(
             )
         })?;
     if !run.status.success() {
-        let _ = fs::remove_file(&output);
         return Err(ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "REMIX_FAILED",
